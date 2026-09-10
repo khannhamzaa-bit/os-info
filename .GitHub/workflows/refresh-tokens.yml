@@ -1,0 +1,46 @@
+name: Refresh JWT Tokens
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests urllib3
+
+      - name: Refresh tokens
+        id: refresh
+        continue-on-error: true
+        run: python scripts/refresh_tokens.py
+
+      - name: Commit updated token.json
+        if: steps.refresh.outcome == 'success'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add token.json
+          if git diff --staged --quiet; then
+            echo "No changes"
+          else
+            git commit -m "auto: refresh JWT tokens [skip ci]"
+            git push
+          fi
+
+      - name: Warn on failure
+        if: steps.refresh.outcome != 'success'
+        run: echo "::warning::Token refresh failed — cached tokens preserved"
