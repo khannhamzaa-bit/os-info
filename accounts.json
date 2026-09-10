@@ -1,0 +1,47 @@
+{
+  "IND": [
+    {"uid": "4712787314", "password": "A3C9F7C0F8FEED9C9C0E7714BF14F8E5C26D0502687F4548394C1905C1728293"},
+    {"uid": "4296688743", "password": "83D7FB3512DDEC7E50223F08F2CDC6CE0ED51C584EBB0749C4770290379FB7EF"},
+    {"uid": "4542695698", "password": "5350DEC06133B573880FA00A692A3186D772E38B0841EA2867680472BCBF3D1D"},
+    {"uid": "4520536411", "password": "B31452B326F2A4C919BEDF5D119AC884043BAAE8BFE168A6CB7C6B4CE7C6A0FD"}
+  ],
+  "BD": [
+    {"uid": "7605697588", "password": "HAMZA_4LNFp8"},
+    {"uid": "7605697593", "password": "HAMZA_tQCiwu"},
+    {"uid": "7605697604", "password": "HAMZA_3gNJ3C"},
+    {"uid": "7605714864", "password": "hamza_VefcrG"},
+    {"uid": "7605714856", "password": "hamza_rCOouK"},
+    {"uid": "7605714866", "password": "hamza_gMvVwj"},
+    {"uid": "7605714867", "password": "hamza_xOAAXN"}
+  ],
+  "BR": [
+    {"uid": "7605730013", "password": "hamza_Wr2E4m"},
+    {"uid": "7605730017", "password": "hamza_oHt2wW"},
+    {"uid": "7605730045", "password": "hamza_GvdXml"},
+    {"uid": "7605730044", "password": "hamza_HL6cWn"}
+  ],
+  "US": [
+    {"uid": "7605737264", "password": "hamza_QBtI9Y"},
+    {"uid": "7605737272", "password": "hamza_L95jns"},
+    {"uid": "7605737265", "password": "hamza_NFrxpz"},
+    {"uid": "7605737273", "password": "hamza_PxNoIv"}
+  ],
+  "ID": [
+    {"uid": "7605759631", "password": "hamza_lrlC19"},
+    {"uid": "7605759626", "password": "hamza_LvlRt3"},
+    {"uid": "7605759628", "password": "hamza_C4ajvJ"},
+    {"uid": "7605759632", "password": "hamza_H914wt"}
+  ],
+  "VN": [
+    {"uid": "7605770475", "password": "hamza_BfrY8d"},
+    {"uid": "7605770468", "password": "hamza_Hmu2Hh"},
+    {"uid": "7605770470", "password": "hamza_jycl5S"},
+    {"uid": "7605770469", "password": "hamza_6tPYB5"}
+  ],
+  "SG": [
+    {"uid": "7605775768", "password": "hamza_UadFRv"},
+    {"uid": "7605775770", "password": "hamza_gDvr2C"},
+    {"uid": "7605775771", "password": "hamza_z83VCt"},
+    {"uid": "7605775773", "password": "hamza_utiWyw"}
+  ]
+}
