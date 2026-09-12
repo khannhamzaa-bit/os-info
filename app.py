@@ -11,7 +11,7 @@ JWT_API = "https://ff-jwt-gen-api.lovable.app/api/public/token?uid={uid}&passwor
 ACCOUNTS_FILE = "accounts.json"
 TOKEN_FILE = os.environ.get("TOKEN_FILE", "token.json")
 CREDIT = "https://t.me/os_codex"
-MAX_CACHE_ENTRIES = 100
+MAX_CACHE_ENTRIES = 200
 
 def load_accounts():
     try:
@@ -26,24 +26,22 @@ ACCOUNTS = load_accounts()
 AES_KEY = bytes([89,103,38,116,99,37,68,69,117,104,54,37,90,99,94,56])
 AES_IV  = bytes([54,111,121,90,68,114,50,50,69,51,121,99,104,106,77,37])
 
-# ==================== FIXED REGION HOSTS ====================
-# Only these hosts actually resolve. Missing regions route through nearest hub.
 REGION_HOSTS = {
     "IND": "https://client.ind.freefiremobile.com",
     "US":  "https://client.us.freefiremobile.com",
-    "NA":  "https://client.us.freefiremobile.com",     # NA → US
+    "NA":  "https://client.us.freefiremobile.com",
     "BR":  "https://client.br.freefiremobile.com",
     "SG":  "https://client.sg.freefiremobile.com",
     "ID":  "https://client.id.freefiremobile.com",
     "TH":  "https://client.th.freefiremobile.com",
     "VN":  "https://client.vn.freefiremobile.com",
-    "ME":  "https://client.ind.freefiremobile.com",    # ME → IND
-    "PK":  "https://client.ind.freefiremobile.com",    # PK → IND
-    "BD":  "https://client.ind.freefiremobile.com",    # BD → IND
-    "EG":  "https://client.ind.freefiremobile.com",    # EG → IND
-    "RU":  "https://client.ind.freefiremobile.com",    # RU → IND
-    "MY":  "https://client.sg.freefiremobile.com",     # MY → SG
-    "PH":  "https://client.sg.freefiremobile.com",     # PH → SG
+    "ME":  "https://client.ind.freefiremobile.com",
+    "PK":  "https://client.ind.freefiremobile.com",
+    "BD":  "https://client.ind.freefiremobile.com",
+    "EG":  "https://client.ind.freefiremobile.com",
+    "RU":  "https://client.ind.freefiremobile.com",
+    "MY":  "https://client.sg.freefiremobile.com",
+    "PH":  "https://client.sg.freefiremobile.com",
 }
 DEFAULT_HOST = "https://client.ind.freefiremobile.com"
 
@@ -51,7 +49,7 @@ SESSION = requests.Session()
 SESSION.verify = False
 SESSION.mount("http://", requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50))
 SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50))
-TIMEOUT = 12
+TIMEOUT = 10
 
 def log(tag, msg):
     print(f"[{time.strftime('%H:%M:%S')}] [{tag}] {msg}", flush=True)
@@ -241,52 +239,51 @@ def fetch_token(acc):
     except Exception as e:
         return None, None, str(e)[:60]
 
-def acquire_token_for_region(region):
-    region = region.upper()
-    for c in load_cache():
-        if c['region'] == region:
-            log("TOKEN", f"cache hit {c['uid']} region={region} ({c['remaining_min']}min)")
-            return c['token'], c['region'], c['uid'], "cache", None
+# ==================== NEW: Get ALL tokens (no region filter) ====================
+def get_all_tokens():
+    """Return ALL cached tokens. If cache empty, fetch fresh from all accounts."""
+    cached = load_cache()
+    if cached:
+        log("TOKEN", f"using {len(cached)} cached tokens (all regions)")
+        return cached, "cache"
 
-    pool = ACCOUNTS.get(region, [])
-    if not pool:
-        return None, None, None, "fail", f"no accounts for region {region}"
+    # Fetch fresh from ALL accounts regardless of region
+    log("TOKEN", "cache empty — fetching fresh from all accounts")
+    tokens = []
+    # Flatten all accounts
+    all_accs = []
+    for region, pool in ACCOUNTS.items():
+        for acc in pool:
+            all_accs.append(acc)
 
-    log("TOKEN", f"fetching {len(pool)} account(s) for region {region}")
-    last = "no accounts"
-    for i, acc in enumerate(pool, 1):
-        log("TOKEN", f"[{i}/{len(pool)}] {acc['uid']}")
+    for acc in all_accs:
         tok, reg, err = fetch_token(acc)
         if tok:
-            log("TOKEN", f"✅ got from {acc['uid']}")
-            return tok, reg, acc['uid'], "api", None
-        log("TOKEN", f"❌ {acc['uid']}: {err}")
-        last = err
+            tokens.append({
+                "token": tok,
+                "region": reg,
+                "uid": acc['uid'],
+                "remaining_min": (jwt_exp(tok) - int(time.time())) // 60,
+            })
 
-    log("TOKEN", f"region {region} failed, trying all regions")
-    for r, pool in ACCOUNTS.items():
-        if r == region:
-            continue
-        for acc in pool:
-            tok, reg, err = fetch_token(acc)
-            if tok:
-                return tok, reg, acc['uid'], "cross_region", None
-    return None, None, None, "fail", last
+    return tokens, "api"
 
-# ==================== FIXED fetch_player WITH FALLBACK ====================
-def fetch_player(jwt, aid, region):
-    """Fetch player with automatic fallback to IND host if region host fails."""
-    region = (region or "IND").upper()
-    host = REGION_HOSTS.get(region, DEFAULT_HOST)
+# ==================== Fetch Player (tries ALL tokens) ====================
+def fetch_player_any_token(aid, region):
+    """Try every cached token until one returns valid data."""
+    host = REGION_HOSTS.get((region or "IND").upper(), DEFAULT_HOST)
     fallback = DEFAULT_HOST
+
+    tokens, source = get_all_tokens()
+    if not tokens:
+        return None, None, None, "no tokens available"
 
     try:
         body = enc(fi(1, aid) + fi(2, 1))
     except Exception as e:
-        return None, f"body error: {str(e)[:60]}"
+        return None, None, None, f"body error: {str(e)[:60]}"
 
-    h = {
-        "Authorization": f"Bearer {jwt}",
+    h_base = {
         "X-GA": "v1 1",
         "ReleaseVersion": "OB54",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -296,28 +293,43 @@ def fetch_player(jwt, aid, region):
         "Accept-Encoding": "deflate, gzip",
     }
 
-    # Try primary host
-    try:
-        r = SESSION.post(f"{host}/GetPlayerPersonalShow",
-                         headers=h, data=body, timeout=TIMEOUT, verify=False)
-        if r.status_code == 200:
-            return parse_resp(r.content), None
-        last_err = f"HTTP {r.status_code}"
-    except Exception as e:
-        last_err = str(e)[:60]
+    last_err = "all tokens failed"
+    tried = 0
 
-    # Fallback to IND if primary failed
-    if host != fallback:
+    for tok_entry in tokens:
+        tried += 1
+        jwt = tok_entry["token"]
+        h = h_base.copy()
+        h["Authorization"] = f"Bearer {jwt}"
+
+        # Try region host first
         try:
-            r = SESSION.post(f"{fallback}/GetPlayerPersonalShow",
+            r = SESSION.post(f"{host}/GetPlayerPersonalShow",
                              headers=h, data=body, timeout=TIMEOUT, verify=False)
             if r.status_code == 200:
-                return parse_resp(r.content), None
-            last_err = f"HTTP {r.status_code} (fallback)"
+                log("FETCH", f"✅ token {tried}/{len(tokens)} works (uid={tok_entry.get('uid')})")
+                return parse_resp(r.content), tok_entry.get('uid'), tok_entry.get('region'), None
+            last_err = f"HTTP {r.status_code}"
         except Exception as e:
-            last_err = str(e)[:60] + " (fallback)"
+            last_err = str(e)[:60]
 
-    return None, last_err
+        # If region host failed and it's not IND, try fallback
+        if host != fallback:
+            try:
+                r = SESSION.post(f"{fallback}/GetPlayerPersonalShow",
+                                 headers=h, data=body, timeout=TIMEOUT, verify=False)
+                if r.status_code == 200:
+                    log("FETCH", f"✅ token {tried}/{len(tokens)} works on fallback (uid={tok_entry.get('uid')})")
+                    return parse_resp(r.content), tok_entry.get('uid'), tok_entry.get('region'), None
+                last_err = f"HTTP {r.status_code} (fallback)"
+            except Exception as e:
+                last_err = str(e)[:60] + " (fallback)"
+
+        # If 401, remove this token from cache
+        if '401' in str(last_err):
+            remove_cache(tok_entry.get('uid'))
+
+    return None, None, None, f"tried {tried} tokens — {last_err}"
 
 BR_RANKS = [(0,"Bronze I"),(100,"Bronze II"),(200,"Bronze III"),
     (300,"Silver I"),(400,"Silver II"),(500,"Silver III"),
@@ -531,41 +543,17 @@ def get_info():
             "premium": {"credit": CREDIT, "message": "Premium API by @os_codex"}
         }), 400
 
-    if region_in not in REGION_HOSTS:
-        return jsonify({
-            "success": False,
-            "error": f"unsupported region '{region_in}'",
-            "supported": list(REGION_HOSTS.keys()),
-            "premium": {"credit": CREDIT, "message": "Premium API by @os_codex"}
-        }), 400
-
     aid = int(uid_in)
     log("GET", f"uid={aid} region={region_in}")
 
-    jwt, region, used_uid, source, err = acquire_token_for_region(region_in)
-    if not jwt:
-        return jsonify({
-            "success": False,
-            "error": "jwt_fetch_failed",
-            "detail": err,
-            "premium": {"credit": CREDIT, "message": "Premium API by @os_codex"}
-        }), 502
-
-    resp, ferr = fetch_player(jwt, aid, region)
-
-    if not resp and ferr and 'HTTP 401' in ferr:
-        log("GET", "401 → refresh + retry")
-        remove_cache(used_uid)
-        jwt2, region2, used_uid2, source2, err2 = acquire_token_for_region(region_in)
-        if jwt2:
-            resp, ferr = fetch_player(jwt2, aid, region2)
-            used_uid, region, source = used_uid2, region2, source2
+    # Try every token
+    resp, used_uid, used_region, err = fetch_player_any_token(aid, region_in)
 
     if not resp:
         return jsonify({
             "success": False,
             "error": "player_fetch_failed",
-            "detail": ferr,
+            "detail": err,
             "premium": {"credit": CREDIT, "message": "Premium API by @os_codex"}
         }), 502
 
@@ -573,9 +561,9 @@ def get_info():
 
     return jsonify({
         "success": True,
-        "region": region,
+        "region": used_region or region_in,
         "used_uid": used_uid,
-        "token_source": source,
+        "token_source": "any",
         "data": report,
         "premium": {
             "credit": CREDIT,
