@@ -29,44 +29,39 @@ ACCOUNTS = load_accounts()
 AES_KEY = bytes([89,103,38,116,99,37,68,69,117,104,54,37,90,99,94,56])
 AES_IV  = bytes([54,111,121,90,68,114,50,50,69,51,121,99,104,106,77,37])
 
-# ==================== HOSTS ====================
-# Try loginbp.ggblueshark.com FIRST (MajorLogin host)
-ALL_HOSTS = [
-    "https://loginbp.ggblueshark.com",
-    "https://loginbp.ggpolarbear.com",
-    "https://client.ind.freefiremobile.com",
-    "https://client.us.freefiremobile.com",
-    "https://client.br.freefiremobile.com",
-    "https://client.sg.freefiremobile.com",
-    "https://client.id.freefiremobile.com",
-    "https://client.th.freefiremobile.com",
-    "https://client.vn.freefiremobile.com",
-]
-
-REGION_HOSTS = {
-    "IND": "https://loginbp.ggblueshark.com",
-    "US":  "https://loginbp.ggblueshark.com",
-    "NA":  "https://loginbp.ggblueshark.com",
-    "BR":  "https://loginbp.ggblueshark.com",
-    "SG":  "https://loginbp.ggblueshark.com",
-    "ID":  "https://loginbp.ggblueshark.com",
-    "TH":  "https://loginbp.ggblueshark.com",
-    "VN":  "https://loginbp.ggblueshark.com",
-    "ME":  "https://loginbp.ggblueshark.com",
-    "PK":  "https://loginbp.ggblueshark.com",
-    "BD":  "https://loginbp.ggblueshark.com",
-    "EG":  "https://loginbp.ggblueshark.com",
-    "RU":  "https://loginbp.ggblueshark.com",
-    "MY":  "https://loginbp.ggblueshark.com",
-    "PH":  "https://loginbp.ggblueshark.com",
+# ==================== REAL HOST MAPPING (from working code) ====================
+REGION_ENDPOINTS = {
+    "IND": "https://client.ind.freefiremobile.com/GetPlayerPersonalShow",
+    "BR":  "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
+    "US":  "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
+    "SAC": "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
+    "NA":  "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
+    "BD":  "https://clientbp.ggblueshark.com/GetPlayerPersonalShow",
+    "ID":  "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+    "PK":  "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+    "VN":  "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+    "ME":  "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+    "TH":  "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+    "SG":  "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+    "MY":  "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+    "PH":  "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+    "RU":  "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+    "default": "https://client.ind.freefiremobile.com/GetPlayerPersonalShow",
 }
-DEFAULT_HOST = "https://loginbp.ggblueshark.com"
+
+# Fallback hosts to try in order
+FALLBACK_HOSTS = [
+    "https://client.ind.freefiremobile.com",
+    "https://clientbp.ggblueshark.com",
+    "https://clientbp.ggpolarbear.com",
+    "https://client.us.freefiremobile.com",
+]
 
 SESSION = requests.Session()
 SESSION.verify = False
 SESSION.mount("http://", requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100))
 SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100))
-TIMEOUT = 8
+TIMEOUT = 10
 
 
 def log(tag, msg):
@@ -209,19 +204,17 @@ def load_cache():
                 "token": tok,
                 "region": (e.get('region') or jwt_region(tok)).upper(),
                 "uid": e.get('uid'),
-                "server_url": e.get('server_url'),
                 "remaining_min": (exp - now) // 60,
             })
     return valid
 
 
-def save_cache(tok, region, uid, server_url=None):
+def save_cache(tok, region, uid):
     try:
         e = {
             "token": tok,
             "region": region,
             "uid": uid,
-            "server_url": server_url,
             "saved_at": int(time.time()),
             "expires_at": jwt_exp(tok),
         }
@@ -257,34 +250,35 @@ def remove_cache(uid):
         pass
 
 
-# ==================== JWT FETCH ====================
+# ==================== JWT FETCH (YOUR API) ====================
 def fetch_token(acc):
+    """Fetch JWT from os-jwt-access.vercel.app."""
     url = JWT_API.format(uid=acc['uid'], password=acc['password'])
     try:
         r = requests.get(url, timeout=15, verify=False)
         if r.status_code != 200:
-            return None, None, None, f"HTTP {r.status_code}"
+            return None, None, f"HTTP {r.status_code}"
 
         data = r.json()
 
+        # Try multiple response field names
         token = None
         if isinstance(data, dict):
-            if data.get("jwt"):
-                token = data["jwt"]
-            elif data.get("token"):
-                token = data["token"]
+            for key in ("jwt", "jwt_token", "token", "access_token"):
+                v = data.get(key)
+                if isinstance(v, str) and v.startswith("eyJ"):
+                    token = v
+                    break
 
         if not token:
-            return None, None, None, data.get("error", "no jwt") if isinstance(data, dict) else "no jwt"
+            return None, None, f"no token: {str(data)[:80]}"
 
         region = (data.get("region") or jwt_region(token)).upper()
-        server_url = data.get("server_url") or data.get("serverUrl")
-
-        save_cache(token, region, acc['uid'], server_url)
-        return token, region, server_url, None
+        save_cache(token, region, acc['uid'])
+        return token, region, None
 
     except Exception as e:
-        return None, None, None, str(e)[:60]
+        return None, None, str(e)[:60]
 
 
 def get_all_tokens():
@@ -301,13 +295,12 @@ def get_all_tokens():
             all_accs.append(acc)
 
     for acc in all_accs:
-        tok, reg, srv, err = fetch_token(acc)
+        tok, reg, err = fetch_token(acc)
         if tok:
             tokens.append({
                 "token": tok,
                 "region": reg,
                 "uid": acc['uid'],
-                "server_url": srv,
                 "remaining_min": (jwt_exp(tok) - int(time.time())) // 60,
             })
 
@@ -317,6 +310,7 @@ def get_all_tokens():
 
 # ==================== FETCH PLAYER ====================
 def fetch_player_any_token(aid, region):
+    """Try every token. Use region endpoint first, then fallback hosts."""
     tokens, source = get_all_tokens()
     if not tokens:
         return None, None, None, "no tokens available"
@@ -336,35 +330,35 @@ def fetch_player_any_token(aid, region):
         "Accept-Encoding": "deflate, gzip",
     }
 
+    # Build hosts list — region-specific first, then fallbacks
+    region_up = (region or "IND").upper()
+    primary = REGION_ENDPOINTS.get(region_up, REGION_ENDPOINTS["default"])
+    hosts = [primary]
+    for h in FALLBACK_HOSTS:
+        url = f"{h}/GetPlayerPersonalShow"
+        if url not in hosts:
+            hosts.append(url)
+
     last_err = "no response"
     attempted = 0
 
     for tok_entry in tokens:
         jwt = tok_entry["token"]
         uid = tok_entry.get("uid")
-
-        # Build host list
-        server_url = tok_entry.get("server_url")
-        if server_url and isinstance(server_url, str) and server_url.startswith("http"):
-            hosts = [server_url.rstrip("/")]
-        else:
-            hosts = list(ALL_HOSTS)
-
         h = h_base.copy()
         h["Authorization"] = f"Bearer {jwt}"
 
-        for host in hosts:
+        for host_url in hosts:
             attempted += 1
             try:
-                r = SESSION.post(f"{host}/GetPlayerPersonalShow",
-                                 headers=h, data=body,
+                r = SESSION.post(host_url, headers=h, data=body,
                                  timeout=TIMEOUT, verify=False)
 
                 if r.status_code == 200:
-                    log("FETCH", f"✅ uid={uid} host={host.split('//')[1][:30]}")
+                    log("FETCH", f"✅ uid={uid} host={host_url.split('//')[1].split('/')[0][:25]}")
                     return parse_resp(r.content), uid, tok_entry.get("region"), None
 
-                last_err = f"HTTP {r.status_code} @ {host.split('//')[1][:25]}"
+                last_err = f"HTTP {r.status_code} @ {host_url.split('//')[1].split('/')[0][:20]}"
 
             except Exception as e:
                 last_err = str(e)[:50]
@@ -372,10 +366,10 @@ def fetch_player_any_token(aid, region):
         if '401' in last_err:
             remove_cache(uid)
 
-    return None, None, None, f"tried {len(tokens)} tokens ({attempted} calls), last: {last_err}"
+    return None, None, None, f"tried {len(tokens)} tokens × {len(hosts)} hosts ({attempted} calls), last: {last_err}"
 
 
-# ==================== RANKS ====================
+# ==================== RANK TABLES ====================
 BR_RANKS = [(0,"Bronze I"),(100,"Bronze II"),(200,"Bronze III"),
     (300,"Silver I"),(400,"Silver II"),(500,"Silver III"),
     (600,"Gold I"),(700,"Gold II"),(800,"Gold III"),
@@ -602,7 +596,7 @@ def refresh_all():
     results = {}
     for region, pool in ACCOUNTS.items():
         for acc in pool:
-            tok, reg, srv, err = fetch_token(acc)
+            tok, reg, err = fetch_token(acc)
             if tok:
                 results.setdefault(region, []).append(acc['uid'])
     return jsonify({"success": True, "regions": results, "credit": CREDIT})
