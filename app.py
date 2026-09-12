@@ -29,8 +29,11 @@ ACCOUNTS = load_accounts()
 AES_KEY = bytes([89,103,38,116,99,37,68,69,117,104,54,37,90,99,94,56])
 AES_IV  = bytes([54,111,121,90,68,114,50,50,69,51,121,99,104,106,77,37])
 
-# All valid hosts (fallback if server_url missing)
+# ==================== HOSTS ====================
+# Try loginbp.ggblueshark.com FIRST (MajorLogin host)
 ALL_HOSTS = [
+    "https://loginbp.ggblueshark.com",
+    "https://loginbp.ggpolarbear.com",
     "https://client.ind.freefiremobile.com",
     "https://client.us.freefiremobile.com",
     "https://client.br.freefiremobile.com",
@@ -41,23 +44,23 @@ ALL_HOSTS = [
 ]
 
 REGION_HOSTS = {
-    "IND": "https://client.ind.freefiremobile.com",
-    "US":  "https://client.us.freefiremobile.com",
-    "NA":  "https://client.us.freefiremobile.com",
-    "BR":  "https://client.br.freefiremobile.com",
-    "SG":  "https://client.sg.freefiremobile.com",
-    "ID":  "https://client.id.freefiremobile.com",
-    "TH":  "https://client.th.freefiremobile.com",
-    "VN":  "https://client.vn.freefiremobile.com",
-    "ME":  "https://client.ind.freefiremobile.com",
-    "PK":  "https://client.ind.freefiremobile.com",
-    "BD":  "https://client.ind.freefiremobile.com",
-    "EG":  "https://client.ind.freefiremobile.com",
-    "RU":  "https://client.ind.freefiremobile.com",
-    "MY":  "https://client.sg.freefiremobile.com",
-    "PH":  "https://client.sg.freefiremobile.com",
+    "IND": "https://loginbp.ggblueshark.com",
+    "US":  "https://loginbp.ggblueshark.com",
+    "NA":  "https://loginbp.ggblueshark.com",
+    "BR":  "https://loginbp.ggblueshark.com",
+    "SG":  "https://loginbp.ggblueshark.com",
+    "ID":  "https://loginbp.ggblueshark.com",
+    "TH":  "https://loginbp.ggblueshark.com",
+    "VN":  "https://loginbp.ggblueshark.com",
+    "ME":  "https://loginbp.ggblueshark.com",
+    "PK":  "https://loginbp.ggblueshark.com",
+    "BD":  "https://loginbp.ggblueshark.com",
+    "EG":  "https://loginbp.ggblueshark.com",
+    "RU":  "https://loginbp.ggblueshark.com",
+    "MY":  "https://loginbp.ggblueshark.com",
+    "PH":  "https://loginbp.ggblueshark.com",
 }
-DEFAULT_HOST = "https://client.ind.freefiremobile.com"
+DEFAULT_HOST = "https://loginbp.ggblueshark.com"
 
 SESSION = requests.Session()
 SESSION.verify = False
@@ -256,7 +259,6 @@ def remove_cache(uid):
 
 # ==================== JWT FETCH ====================
 def fetch_token(acc):
-    """Fetch JWT from your API. Extracts server_url if present."""
     url = JWT_API.format(uid=acc['uid'], password=acc['password'])
     try:
         r = requests.get(url, timeout=15, verify=False)
@@ -265,15 +267,12 @@ def fetch_token(acc):
 
         data = r.json()
 
-        # Extract token (multiple shapes)
         token = None
         if isinstance(data, dict):
             if data.get("jwt"):
                 token = data["jwt"]
             elif data.get("token"):
                 token = data["token"]
-            elif data.get("success") and data.get("jwt"):
-                token = data["jwt"]
 
         if not token:
             return None, None, None, data.get("error", "no jwt") if isinstance(data, dict) else "no jwt"
@@ -289,13 +288,12 @@ def fetch_token(acc):
 
 
 def get_all_tokens():
-    """Return all valid cached tokens. Fetch fresh if cache empty."""
     cached = load_cache()
     if cached:
         log("TOKEN", f"using {len(cached)} cached tokens")
         return cached, "cache"
 
-    log("TOKEN", "cache empty — fetching fresh from all accounts")
+    log("TOKEN", "cache empty — fetching fresh")
     tokens = []
     all_accs = []
     for region, pool in ACCOUNTS.items():
@@ -319,7 +317,6 @@ def get_all_tokens():
 
 # ==================== FETCH PLAYER ====================
 def fetch_player_any_token(aid, region):
-    """Try every token. Use server_url from JWT API when available."""
     tokens, source = get_all_tokens()
     if not tokens:
         return None, None, None, "no tokens available"
@@ -346,19 +343,12 @@ def fetch_player_any_token(aid, region):
         jwt = tok_entry["token"]
         uid = tok_entry.get("uid")
 
-        # Build host list for THIS token
+        # Build host list
         server_url = tok_entry.get("server_url")
         if server_url and isinstance(server_url, str) and server_url.startswith("http"):
-            # Use the exact serverUrl from MajorLogin
             hosts = [server_url.rstrip("/")]
         else:
-            # Fallback: region-specific host + all others
-            hosts = []
-            r_host = REGION_HOSTS.get((region or "IND").upper(), DEFAULT_HOST)
-            hosts.append(r_host)
-            for h in ALL_HOSTS:
-                if h not in hosts:
-                    hosts.append(h)
+            hosts = list(ALL_HOSTS)
 
         h = h_base.copy()
         h["Authorization"] = f"Bearer {jwt}"
@@ -379,14 +369,13 @@ def fetch_player_any_token(aid, region):
             except Exception as e:
                 last_err = str(e)[:50]
 
-        # Remove token if it failed with 401 on all hosts
         if '401' in last_err:
             remove_cache(uid)
 
     return None, None, None, f"tried {len(tokens)} tokens ({attempted} calls), last: {last_err}"
 
 
-# ==================== RANK TABLES ====================
+# ==================== RANKS ====================
 BR_RANKS = [(0,"Bronze I"),(100,"Bronze II"),(200,"Bronze III"),
     (300,"Silver I"),(400,"Silver II"),(500,"Silver III"),
     (600,"Gold I"),(700,"Gold II"),(800,"Gold III"),
