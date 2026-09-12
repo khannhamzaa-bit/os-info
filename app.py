@@ -7,11 +7,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-JWT_API = "https://ff-jwt-gen-api.lovable.app/api/public/token?uid={uid}&password={password}"
+# ==================== CONFIG ====================
+JWT_API = "https://os-jwt-access.vercel.app/jwt?uid={uid}&password={password}"
 ACCOUNTS_FILE = "accounts.json"
 TOKEN_FILE = os.environ.get("TOKEN_FILE", "token.json")
 CREDIT = "https://t.me/os_codex"
 MAX_CACHE_ENTRIES = 200
+
 
 def load_accounts():
     try:
@@ -21,10 +23,22 @@ def load_accounts():
         print(f"[INIT] failed to load {ACCOUNTS_FILE}: {e}")
         return {}
 
+
 ACCOUNTS = load_accounts()
 
 AES_KEY = bytes([89,103,38,116,99,37,68,69,117,104,54,37,90,99,94,56])
 AES_IV  = bytes([54,111,121,90,68,114,50,50,69,51,121,99,104,106,77,37])
+
+# All valid hosts (fallback if server_url missing)
+ALL_HOSTS = [
+    "https://client.ind.freefiremobile.com",
+    "https://client.us.freefiremobile.com",
+    "https://client.br.freefiremobile.com",
+    "https://client.sg.freefiremobile.com",
+    "https://client.id.freefiremobile.com",
+    "https://client.th.freefiremobile.com",
+    "https://client.vn.freefiremobile.com",
+]
 
 REGION_HOSTS = {
     "IND": "https://client.ind.freefiremobile.com",
@@ -47,18 +61,22 @@ DEFAULT_HOST = "https://client.ind.freefiremobile.com"
 
 SESSION = requests.Session()
 SESSION.verify = False
-SESSION.mount("http://", requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50))
-SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50))
-TIMEOUT = 10
+SESSION.mount("http://", requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100))
+SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100))
+TIMEOUT = 8
+
 
 def log(tag, msg):
     print(f"[{time.strftime('%H:%M:%S')}] [{tag}] {msg}", flush=True)
 
+
 def enc(d):
     return AES.new(AES_KEY, AES.MODE_CBC, AES_IV).encrypt(pad(d, AES.block_size))
 
+
 def dec(d):
     return unpad(AES.new(AES_KEY, AES.MODE_CBC, AES_IV).decrypt(d), AES.block_size)
+
 
 def vi(n):
     o = []
@@ -72,8 +90,10 @@ def vi(n):
             break
     return bytes(o)
 
+
 def fi(f, n):
     return vi((f << 3) | 0) + vi(int(n))
+
 
 def rv(d, o):
     r = 0
@@ -86,6 +106,7 @@ def rv(d, o):
             break
         s += 7
     return r, o
+
 
 def pp(d):
     r = {}
@@ -126,6 +147,7 @@ def pp(d):
             break
     return r
 
+
 def parse_resp(raw):
     try:
         return json.loads(raw)
@@ -140,6 +162,7 @@ def parse_resp(raw):
     except Exception:
         return {}
 
+
 def decode_jwt(j):
     try:
         s = j.split('.')[1]
@@ -148,14 +171,18 @@ def decode_jwt(j):
     except Exception:
         return {}
 
+
 def jwt_exp(j):
     return int(decode_jwt(j).get('exp') or 0)
+
 
 def jwt_region(j):
     p = decode_jwt(j)
     return (p.get('noti_region') or p.get('country_code')
             or p.get('lock_region') or 'IND').upper()
 
+
+# ==================== CACHE ====================
 def load_cache():
     if not os.path.exists(TOKEN_FILE):
         return []
@@ -179,14 +206,22 @@ def load_cache():
                 "token": tok,
                 "region": (e.get('region') or jwt_region(tok)).upper(),
                 "uid": e.get('uid'),
+                "server_url": e.get('server_url'),
                 "remaining_min": (exp - now) // 60,
             })
     return valid
 
-def save_cache(tok, region, uid):
+
+def save_cache(tok, region, uid, server_url=None):
     try:
-        e = {"token": tok, "region": region, "uid": uid,
-             "saved_at": int(time.time()), "expires_at": jwt_exp(tok)}
+        e = {
+            "token": tok,
+            "region": region,
+            "uid": uid,
+            "server_url": server_url,
+            "saved_at": int(time.time()),
+            "expires_at": jwt_exp(tok),
+        }
         ex = []
         if os.path.exists(TOKEN_FILE):
             try:
@@ -204,6 +239,7 @@ def save_cache(tok, region, uid):
     except Exception:
         pass
 
+
 def remove_cache(uid):
     if not os.path.exists(TOKEN_FILE):
         return
@@ -217,63 +253,73 @@ def remove_cache(uid):
     except Exception:
         pass
 
+
+# ==================== JWT FETCH ====================
 def fetch_token(acc):
+    """Fetch JWT from your API. Extracts server_url if present."""
     url = JWT_API.format(uid=acc['uid'], password=acc['password'])
     try:
-        r = requests.get(url, timeout=TIMEOUT, verify=False)
+        r = requests.get(url, timeout=15, verify=False)
         if r.status_code != 200:
-            d = ""
-            try:
-                j = r.json()
-                d = j.get("message") or j.get("detail") or ""
-            except Exception:
-                d = r.text[:60]
-            return None, None, f"HTTP {r.status_code} {d}".strip()
-        data = r.json()
-        tok = data.get("token")
-        if not tok:
-            return None, None, "no token"
-        reg = jwt_region(tok)
-        save_cache(tok, reg, acc['uid'])
-        return tok, reg, None
-    except Exception as e:
-        return None, None, str(e)[:60]
+            return None, None, None, f"HTTP {r.status_code}"
 
-# ==================== NEW: Get ALL tokens (no region filter) ====================
+        data = r.json()
+
+        # Extract token (multiple shapes)
+        token = None
+        if isinstance(data, dict):
+            if data.get("jwt"):
+                token = data["jwt"]
+            elif data.get("token"):
+                token = data["token"]
+            elif data.get("success") and data.get("jwt"):
+                token = data["jwt"]
+
+        if not token:
+            return None, None, None, data.get("error", "no jwt") if isinstance(data, dict) else "no jwt"
+
+        region = (data.get("region") or jwt_region(token)).upper()
+        server_url = data.get("server_url") or data.get("serverUrl")
+
+        save_cache(token, region, acc['uid'], server_url)
+        return token, region, server_url, None
+
+    except Exception as e:
+        return None, None, None, str(e)[:60]
+
+
 def get_all_tokens():
-    """Return ALL cached tokens. If cache empty, fetch fresh from all accounts."""
+    """Return all valid cached tokens. Fetch fresh if cache empty."""
     cached = load_cache()
     if cached:
-        log("TOKEN", f"using {len(cached)} cached tokens (all regions)")
+        log("TOKEN", f"using {len(cached)} cached tokens")
         return cached, "cache"
 
-    # Fetch fresh from ALL accounts regardless of region
     log("TOKEN", "cache empty — fetching fresh from all accounts")
     tokens = []
-    # Flatten all accounts
     all_accs = []
     for region, pool in ACCOUNTS.items():
         for acc in pool:
             all_accs.append(acc)
 
     for acc in all_accs:
-        tok, reg, err = fetch_token(acc)
+        tok, reg, srv, err = fetch_token(acc)
         if tok:
             tokens.append({
                 "token": tok,
                 "region": reg,
                 "uid": acc['uid'],
+                "server_url": srv,
                 "remaining_min": (jwt_exp(tok) - int(time.time())) // 60,
             })
 
+    log("TOKEN", f"fetched {len(tokens)} tokens")
     return tokens, "api"
 
-# ==================== Fetch Player (tries ALL tokens) ====================
-def fetch_player_any_token(aid, region):
-    """Try every cached token until one returns valid data."""
-    host = REGION_HOSTS.get((region or "IND").upper(), DEFAULT_HOST)
-    fallback = DEFAULT_HOST
 
+# ==================== FETCH PLAYER ====================
+def fetch_player_any_token(aid, region):
+    """Try every token. Use server_url from JWT API when available."""
     tokens, source = get_all_tokens()
     if not tokens:
         return None, None, None, "no tokens available"
@@ -293,44 +339,54 @@ def fetch_player_any_token(aid, region):
         "Accept-Encoding": "deflate, gzip",
     }
 
-    last_err = "all tokens failed"
-    tried = 0
+    last_err = "no response"
+    attempted = 0
 
     for tok_entry in tokens:
-        tried += 1
         jwt = tok_entry["token"]
+        uid = tok_entry.get("uid")
+
+        # Build host list for THIS token
+        server_url = tok_entry.get("server_url")
+        if server_url and isinstance(server_url, str) and server_url.startswith("http"):
+            # Use the exact serverUrl from MajorLogin
+            hosts = [server_url.rstrip("/")]
+        else:
+            # Fallback: region-specific host + all others
+            hosts = []
+            r_host = REGION_HOSTS.get((region or "IND").upper(), DEFAULT_HOST)
+            hosts.append(r_host)
+            for h in ALL_HOSTS:
+                if h not in hosts:
+                    hosts.append(h)
+
         h = h_base.copy()
         h["Authorization"] = f"Bearer {jwt}"
 
-        # Try region host first
-        try:
-            r = SESSION.post(f"{host}/GetPlayerPersonalShow",
-                             headers=h, data=body, timeout=TIMEOUT, verify=False)
-            if r.status_code == 200:
-                log("FETCH", f"✅ token {tried}/{len(tokens)} works (uid={tok_entry.get('uid')})")
-                return parse_resp(r.content), tok_entry.get('uid'), tok_entry.get('region'), None
-            last_err = f"HTTP {r.status_code}"
-        except Exception as e:
-            last_err = str(e)[:60]
-
-        # If region host failed and it's not IND, try fallback
-        if host != fallback:
+        for host in hosts:
+            attempted += 1
             try:
-                r = SESSION.post(f"{fallback}/GetPlayerPersonalShow",
-                                 headers=h, data=body, timeout=TIMEOUT, verify=False)
+                r = SESSION.post(f"{host}/GetPlayerPersonalShow",
+                                 headers=h, data=body,
+                                 timeout=TIMEOUT, verify=False)
+
                 if r.status_code == 200:
-                    log("FETCH", f"✅ token {tried}/{len(tokens)} works on fallback (uid={tok_entry.get('uid')})")
-                    return parse_resp(r.content), tok_entry.get('uid'), tok_entry.get('region'), None
-                last_err = f"HTTP {r.status_code} (fallback)"
+                    log("FETCH", f"✅ uid={uid} host={host.split('//')[1][:30]}")
+                    return parse_resp(r.content), uid, tok_entry.get("region"), None
+
+                last_err = f"HTTP {r.status_code} @ {host.split('//')[1][:25]}"
+
             except Exception as e:
-                last_err = str(e)[:60] + " (fallback)"
+                last_err = str(e)[:50]
 
-        # If 401, remove this token from cache
-        if '401' in str(last_err):
-            remove_cache(tok_entry.get('uid'))
+        # Remove token if it failed with 401 on all hosts
+        if '401' in last_err:
+            remove_cache(uid)
 
-    return None, None, None, f"tried {tried} tokens — {last_err}"
+    return None, None, None, f"tried {len(tokens)} tokens ({attempted} calls), last: {last_err}"
 
+
+# ==================== RANK TABLES ====================
 BR_RANKS = [(0,"Bronze I"),(100,"Bronze II"),(200,"Bronze III"),
     (300,"Silver I"),(400,"Silver II"),(500,"Silver III"),
     (600,"Gold I"),(700,"Gold II"),(800,"Gold III"),
@@ -338,6 +394,7 @@ BR_RANKS = [(0,"Bronze I"),(100,"Bronze II"),(200,"Bronze III"),
     (1200,"Diamond I"),(1300,"Diamond II"),(1400,"Diamond III"),
     (1500,"Diamond IV"),(1700,"Heroic"),(2000,"Elite Heroic"),
     (2300,"Master"),(2600,"Elite Master"),(2900,"Grandmaster")]
+
 
 def br_rank_name(p):
     n = "Bronze I"
@@ -347,6 +404,7 @@ def br_rank_name(p):
         else:
             break
     return n
+
 
 def cs_rank_name(p):
     for t, n in [(2900,"Grandmaster"),(2600,"Elite Master"),(2300,"Master"),
@@ -358,15 +416,17 @@ def cs_rank_name(p):
             return n
     return "Bronze"
 
+
 PET_NAMES = {
     1300000001:"Kitty", 1300000002:"Ottero", 1300000003:"Mr. Waggor",
     1300000004:"Falco", 1300000005:"Robby", 1300000006:"Shiba",
     1300000007:"Sensei Tig", 1300000008:"Agent Hop", 1300000009:"Beaston",
-    1300000010:"Moony", 1300000011:"Dreki", 1300000012:"Poring",
 }
+
 
 def pet_name(pid):
     return PET_NAMES.get(pid, f"Pet {pid}")
+
 
 def g(d, k, default=None):
     if not isinstance(d, dict):
@@ -376,6 +436,7 @@ def g(d, k, default=None):
         return v['data']
     return v if v is not None else default
 
+
 def decode_hex(h):
     if not isinstance(h, str) or not h:
         return ""
@@ -383,6 +444,7 @@ def decode_hex(h):
         return bytes.fromhex(h).decode('utf-8', 'ignore').strip()
     except Exception:
         return ""
+
 
 def fmt_ts(ts):
     if not ts or not isinstance(ts, int):
@@ -392,6 +454,7 @@ def fmt_ts(ts):
                              time.gmtime(ts + 5 * 3600 + 30 * 60))
     except Exception:
         return str(ts)
+
 
 def build_report(resp):
     p = g(resp, 1) or {}
@@ -437,14 +500,10 @@ def build_report(resp):
     if isinstance(pet_blk, dict) and pet_blk:
         pid = pet_blk.get('1') or pet_blk.get(1)
         pet_out = {
-            "equipped": True,
-            "id": pid,
-            "name": pet_name(pid),
+            "equipped": True, "id": pid, "name": pet_name(pid),
             "type": pet_name(pid),
             "level": pet_blk.get('3') or pet_blk.get(3),
             "exp": pet_blk.get('4') or pet_blk.get(4),
-            "skin": pet_blk.get('6') or pet_blk.get(6),
-            "skill": pet_blk.get('9') or pet_blk.get(9),
         }
 
     clan_out = None
@@ -459,24 +518,10 @@ def build_report(resp):
             "members_max": c.get('5') or c.get(5),
         }
         if isinstance(L, dict) and L:
-            cs_l = g(g(L, 61, {}), 3, {})
-            cs_l_pts = cs_l.get('3', 0) if isinstance(cs_l, dict) else 0
-            l_bp_t = g(g(L, 63, {}), 1, {})
-            l_bp_type = l_bp_t.get('1', 0) if isinstance(l_bp_t, dict) else 0
             clan_out["leader"] = {
                 "name": L.get('3') or L.get(3),
                 "uid": L.get('1') or L.get(1),
                 "level": L.get('6') or L.get(6),
-                "exp": L.get('7') or L.get(7),
-                "region": L.get('5') or L.get(5),
-                "ob": L.get('50') or L.get(50),
-                "bp": {1: "Free", 2: "Premium", 9: "Basic"}.get(l_bp_type, "Basic"),
-                "created": L.get('24') or L.get(24),
-                "last_login": L.get('44') or L.get(44),
-                "bp_badges": L.get('18') or L.get(18),
-                "title": L.get('75') or "Not Found",
-                "br_points": L.get('15') or L.get(15),
-                "cs_pts": cs_l_pts,
             }
 
     craftland = None
@@ -491,45 +536,31 @@ def build_report(resp):
 
     return {
         "basic": {
-            "prime_level": prime,
-            "name": name,
-            "uid": uid,
-            "level": level,
-            "exp": exp,
-            "region": region,
-            "likes": likes,
-            "honor_score": honor_score,
-            "celebrity": False,
+            "prime_level": prime, "name": name, "uid": uid,
+            "level": level, "exp": exp, "region": region, "likes": likes,
+            "honor_score": honor_score, "celebrity": False,
             "title": g(p, 75, "") or "Not Found",
-            "signature": bio,
-            "gender": gender,
+            "signature": bio, "gender": gender,
         },
         "activity": {
-            "ob": ob,
-            "bp": bp_label,
-            "bp_badges": bp_badges,
-            "br_points": br_points,
-            "br_rank": br_rank_name(br_points),
-            "cs_points": cs_pts,
-            "cs_rank": cs_rank_name(cs_pts),
-            "cs_stars": cs_stars,
-            "show_rank": show_rank_str,
-            "show_br": bool(show_br),
-            "show_cs": bool(show_cs),
-            "created_at": fmt_ts(created),
-            "last_login": fmt_ts(last_login),
+            "ob": ob, "bp": bp_label, "bp_badges": bp_badges,
+            "br_points": br_points, "br_rank": br_rank_name(br_points),
+            "cs_points": cs_pts, "cs_rank": cs_rank_name(cs_pts),
+            "cs_stars": cs_stars, "show_rank": show_rank_str,
+            "show_br": bool(show_br), "show_cs": bool(show_cs),
+            "created_at": fmt_ts(created), "last_login": fmt_ts(last_login),
         },
         "overview": {
-            "avatar_id": g(p, 12, 0),
-            "banner_id": g(p, 11, 0),
-            "pin": "Not Found",
-            "language": "English",
+            "avatar_id": g(p, 12, 0), "banner_id": g(p, 11, 0),
+            "pin": "Not Found", "language": "English",
         },
         "pet": pet_out,
         "clan": clan_out,
         "craftland": craftland,
     }
 
+
+# ==================== ROUTES ====================
 @app.route('/get', methods=['GET'])
 def get_info():
     uid_in = request.args.get('info', '').strip()
@@ -546,7 +577,6 @@ def get_info():
     aid = int(uid_in)
     log("GET", f"uid={aid} region={region_in}")
 
-    # Try every token
     resp, used_uid, used_region, err = fetch_player_any_token(aid, region_in)
 
     if not resp:
@@ -568,10 +598,10 @@ def get_info():
         "premium": {
             "credit": CREDIT,
             "message": "💎 Premium API by @os_codex",
-            "note": "Unlock higher rate limits & extra features — contact @os_codex",
             "telegram": CREDIT,
         }
     })
+
 
 @app.route('/token/refresh', methods=['GET'])
 def refresh_all():
@@ -583,10 +613,11 @@ def refresh_all():
     results = {}
     for region, pool in ACCOUNTS.items():
         for acc in pool:
-            tok, reg, err = fetch_token(acc)
+            tok, reg, srv, err = fetch_token(acc)
             if tok:
                 results.setdefault(region, []).append(acc['uid'])
     return jsonify({"success": True, "regions": results, "credit": CREDIT})
+
 
 @app.route('/regions', methods=['GET'])
 def regions_info():
@@ -601,6 +632,7 @@ def regions_info():
         "credit": CREDIT,
     })
 
+
 @app.route('/')
 def home():
     return jsonify({
@@ -611,6 +643,7 @@ def home():
         "premium": {"credit": CREDIT, "message": "💎 Premium API by @os_codex"},
     })
 
+
 if __name__ == '__main__':
     print("\n" + "=" * 60)
     print("   ADVANCED PLAYER INFO API")
@@ -618,9 +651,7 @@ if __name__ == '__main__':
     total = sum(len(v) for v in ACCOUNTS.values())
     print(f"   Regions   : {len(ACCOUNTS)}")
     print(f"   Accounts  : {total}")
-    for r, pool in ACCOUNTS.items():
-        print(f"      {r}: {len(pool)} account(s)")
-    print(f"   Endpoint  : /get?info={{uid}}&region={{region}}")
+    print(f"   JWT API   : {JWT_API[:60]}")
     print(f"   Credit    : {CREDIT}")
     print("=" * 60 + "\n")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
