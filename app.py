@@ -26,22 +26,24 @@ ACCOUNTS = load_accounts()
 AES_KEY = bytes([89,103,38,116,99,37,68,69,117,104,54,37,90,99,94,56])
 AES_IV  = bytes([54,111,121,90,68,114,50,50,69,51,121,99,104,106,77,37])
 
+# ==================== FIXED REGION HOSTS ====================
+# Only these hosts actually resolve. Missing regions route through nearest hub.
 REGION_HOSTS = {
     "IND": "https://client.ind.freefiremobile.com",
-    "BD":  "https://client.bd.freefiremobile.com",
-    "BR":  "https://client.br.freefiremobile.com",
     "US":  "https://client.us.freefiremobile.com",
-    "NA":  "https://client.na.freefiremobile.com",
-    "ID":  "https://client.id.freefiremobile.com",
-    "VN":  "https://client.vn.freefiremobile.com",
+    "NA":  "https://client.us.freefiremobile.com",     # NA → US
+    "BR":  "https://client.br.freefiremobile.com",
     "SG":  "https://client.sg.freefiremobile.com",
+    "ID":  "https://client.id.freefiremobile.com",
     "TH":  "https://client.th.freefiremobile.com",
-    "ME":  "https://client.me.freefiremobile.com",
-    "PK":  "https://client.pk.freefiremobile.com",
-    "EG":  "https://client.eg.freefiremobile.com",
-    "RU":  "https://client.ru.freefiremobile.com",
-    "MY":  "https://client.my.freefiremobile.com",
-    "PH":  "https://client.ph.freefiremobile.com",
+    "VN":  "https://client.vn.freefiremobile.com",
+    "ME":  "https://client.ind.freefiremobile.com",    # ME → IND
+    "PK":  "https://client.ind.freefiremobile.com",    # PK → IND
+    "BD":  "https://client.ind.freefiremobile.com",    # BD → IND
+    "EG":  "https://client.ind.freefiremobile.com",    # EG → IND
+    "RU":  "https://client.ind.freefiremobile.com",    # RU → IND
+    "MY":  "https://client.sg.freefiremobile.com",     # MY → SG
+    "PH":  "https://client.sg.freefiremobile.com",     # PH → SG
 }
 DEFAULT_HOST = "https://client.ind.freefiremobile.com"
 
@@ -49,7 +51,7 @@ SESSION = requests.Session()
 SESSION.verify = False
 SESSION.mount("http://", requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50))
 SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50))
-TIMEOUT = 15
+TIMEOUT = 12
 
 def log(tag, msg):
     print(f"[{time.strftime('%H:%M:%S')}] [{tag}] {msg}", flush=True)
@@ -271,26 +273,51 @@ def acquire_token_for_region(region):
                 return tok, reg, acc['uid'], "cross_region", None
     return None, None, None, "fail", last
 
+# ==================== FIXED fetch_player WITH FALLBACK ====================
 def fetch_player(jwt, aid, region):
+    """Fetch player with automatic fallback to IND host if region host fails."""
+    region = (region or "IND").upper()
     host = REGION_HOSTS.get(region, DEFAULT_HOST)
+    fallback = DEFAULT_HOST
+
     try:
         body = enc(fi(1, aid) + fi(2, 1))
-        h = {
-            "Authorization": f"Bearer {jwt}",
-            "X-GA": "v1 1",
-            "ReleaseVersion": "OB54",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-            "X-Unity-Version": "2022.3.47f1",
-            "Accept": "*/*",
-            "Accept-Encoding": "deflate, gzip",
-        }
-        r = SESSION.post(f"{host}/GetPlayerPersonalShow", headers=h, data=body, timeout=TIMEOUT)
-        if r.status_code != 200:
-            return None, f"HTTP {r.status_code}"
-        return parse_resp(r.content), None
     except Exception as e:
-        return None, str(e)[:80]
+        return None, f"body error: {str(e)[:60]}"
+
+    h = {
+        "Authorization": f"Bearer {jwt}",
+        "X-GA": "v1 1",
+        "ReleaseVersion": "OB54",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+        "X-Unity-Version": "2022.3.47f1",
+        "Accept": "*/*",
+        "Accept-Encoding": "deflate, gzip",
+    }
+
+    # Try primary host
+    try:
+        r = SESSION.post(f"{host}/GetPlayerPersonalShow",
+                         headers=h, data=body, timeout=TIMEOUT, verify=False)
+        if r.status_code == 200:
+            return parse_resp(r.content), None
+        last_err = f"HTTP {r.status_code}"
+    except Exception as e:
+        last_err = str(e)[:60]
+
+    # Fallback to IND if primary failed
+    if host != fallback:
+        try:
+            r = SESSION.post(f"{fallback}/GetPlayerPersonalShow",
+                             headers=h, data=body, timeout=TIMEOUT, verify=False)
+            if r.status_code == 200:
+                return parse_resp(r.content), None
+            last_err = f"HTTP {r.status_code} (fallback)"
+        except Exception as e:
+            last_err = str(e)[:60] + " (fallback)"
+
+    return None, last_err
 
 BR_RANKS = [(0,"Bronze I"),(100,"Bronze II"),(200,"Bronze III"),
     (300,"Silver I"),(400,"Silver II"),(500,"Silver III"),
@@ -349,7 +376,8 @@ def fmt_ts(ts):
     if not ts or not isinstance(ts, int):
         return "N/A"
     try:
-        return time.strftime("%d %B %Y at %I:%M:%S %p (IST)", time.gmtime(ts))
+        return time.strftime("%d %B %Y at %I:%M:%S %p (IST)",
+                             time.gmtime(ts + 5 * 3600 + 30 * 60))
     except Exception:
         return str(ts)
 
