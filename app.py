@@ -10,10 +10,11 @@ app = Flask(__name__)
 
 # ==================== CONFIG ====================
 JWT_API = "https://os-jwt-access.vercel.app/jwt?uid={uid}&password={password}"
+TOKEN_FILE = os.environ.get("TOKEN_FILE", "token.json")
 CREDIT = "https://t.me/os_codex"
-VERSION = "3.0"
+VERSION = "5.0"
 
-# ==================== ACCOUNTS ====================
+# ==================== ACCOUNTS (fallback if token.json missing) ====================
 JWT_ACCOUNTS = {
     "IND": [
         {"uid": "4712787314", "password": "A3C9F7C0F8FEED9C9C0E7714BF14F8E5C26D0502687F4548394C1905C1728293"},
@@ -75,16 +76,17 @@ SESSION.verify = False
 _adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=0)
 SESSION.mount("http://", _adapter)
 SESSION.mount("https://", _adapter)
-TIMEOUT = 6
-WORKERS = 15
+TIMEOUT = 5
+WORKERS = 20
 
-# ==================== Caches ====================
-_TOKEN_CACHE = {}
-_TOKEN_LOCK = threading.Lock()
-_TOKEN_TTL = 600
+# ==================== Module-Level Caches ====================
+_TOKENS = None
+_TOKENS_LOADED_AT = 0
+_TOKENS_LOCK = threading.Lock()
+_TOKENS_TTL = 300
 
-_RESPONSE_CACHE = {}
-_RESPONSE_LOCK = threading.Lock()
+_RESPONSES = {}
+_RESPONSES_LOCK = threading.Lock()
 _RESPONSE_TTL = 1800
 
 _METRICS = {"total": 0, "success": 0, "fail": 0, "cache_hit": 0, "time": 0.0}
@@ -149,6 +151,10 @@ def pp(d, depth=0):
                 n = pp(v, depth + 1)
                 r[f] = n if n else v.hex()
             except: r[f] = v.hex()
+        elif w == 5:
+            r[f] = int.from_bytes(d[o:o+4], 'little'); o += 4
+        elif w == 1:
+            r[f] = int.from_bytes(d[o:o+8], 'little'); o += 8
         else: break
     return r
 
@@ -162,7 +168,7 @@ def parse_resp(raw):
     except: return {}
 
 
-# ==================== JWT ====================
+# ==================== JWT Helpers ====================
 def decode_jwt(j):
     try:
         s = j.split('.')[1]; s += '=' * (-len(s) % 4)
@@ -174,8 +180,72 @@ def jwt_exp(j):
     return int(decode_jwt(j).get('exp') or 0)
 
 
-# ==================== Token Fetch (parallel) ====================
-def fetch_jwt(uid, password):
+def jwt_region(j):
+    p = decode_jwt(j)
+    return (p.get('noti_region') or p.get('country_code')
+            or p.get('lock_region') or 'IND').upper()
+
+
+# ==================== Token File Loader ====================
+def find_token_file():
+    """Try multiple paths to locate token.json."""
+    paths = [
+        os.environ.get("TOKEN_FILE", ""),
+        "token.json",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "token.json"),
+        os.path.join(os.getcwd(), "token.json"),
+        "/var/task/token.json",
+        "/tmp/token.json",
+    ]
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def load_tokens_from_file():
+    """Load tokens from token.json. Returns {region: entry} dict."""
+    path = find_token_file()
+    if not path:
+        log("TOKEN", "no token.json found")
+        return {}
+
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        log("TOKEN", f"parse error: {e}")
+        return {}
+
+    entries = data if isinstance(data, list) else [data]
+    now = int(time.time())
+    tokens = {}
+
+    for e in entries:
+        if not isinstance(e, dict): continue
+        tok = e.get("token")
+        if not tok: continue
+
+        exp = jwt_exp(tok) or int(e.get("expires_at") or 0)
+        if not exp or now >= (exp - 300):
+            continue
+
+        region = (e.get("region") or jwt_region(tok)).upper()
+        tokens[region] = {
+            "uid": e.get("uid"),
+            "token": tok,
+            "region": region,
+            "exp": exp,
+            "remaining_min": (exp - now) // 60,
+        }
+
+    log("TOKEN", f"loaded {len(tokens)} tokens from {path}")
+    return tokens
+
+
+def fetch_token_fallback(uid, password):
+    """Fallback: fetch JWT directly from API."""
     try:
         r = SESSION.get(JWT_API.format(uid=uid, password=password), timeout=TIMEOUT)
         if r.status_code != 200: return None
@@ -187,51 +257,60 @@ def fetch_jwt(uid, password):
     except: return None
 
 
-def fetch_region_token(region, accounts):
-    for acc in accounts:
-        tok = fetch_jwt(acc["uid"], acc["password"])
-        if tok:
-            exp = jwt_exp(tok)
-            return region, {
-                "uid": acc["uid"], "token": tok, "region": region,
-                "exp": exp, "remaining_min": (exp - int(time.time())) // 60,
-            }
-    return region, None
+def fetch_all_fallback():
+    """Fetch all tokens from JWT API in parallel (only if file missing)."""
+    def fetch_region(region, accounts):
+        for acc in accounts:
+            tok = fetch_token_fallback(acc["uid"], acc["password"])
+            if tok:
+                exp = jwt_exp(tok)
+                return region, {
+                    "uid": acc["uid"], "token": tok, "region": region,
+                    "exp": exp, "remaining_min": (exp - int(time.time())) // 60,
+                }
+        return region, None
 
-
-def get_tokens():
-    with _TOKEN_LOCK:
-        now = time.time()
-        if _TOKEN_CACHE and (now - _TOKEN_CACHE.get("_loaded_at", 0)) < _TOKEN_TTL:
-            return {k: v for k, v in _TOKEN_CACHE.items() if k != "_loaded_at"}
-
-    log("TOKEN", "fetching parallel...")
+    log("TOKEN", "fetching from JWT API (no file)")
+    results = {}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futs = {pool.submit(fetch_region_token, r, JWT_ACCOUNTS[r]): r
-                for r in JWT_ACCOUNTS}
-        results = {}
+        futs = {pool.submit(fetch_region, r, JWT_ACCOUNTS[r]): r for r in JWT_ACCOUNTS}
         for f in as_completed(futs):
             region, entry = f.result()
             if entry:
                 results[region] = entry
-                log("TOKEN", f"✅ {region}")
-
-    with _TOKEN_LOCK:
-        for r, e in results.items():
-            _TOKEN_CACHE[r] = e
-        _TOKEN_CACHE["_loaded_at"] = time.time()
-
     return results
 
 
+def get_tokens():
+    """Return tokens — from file cache, or fetch fresh."""
+    global _TOKENS, _TOKENS_LOADED_AT
+
+    now = time.time()
+    with _TOKENS_LOCK:
+        if _TOKENS and (now - _TOKENS_LOADED_AT) < _TOKENS_TTL:
+            return _TOKENS
+
+    tokens = load_tokens_from_file()
+    if not tokens:
+        tokens = fetch_all_fallback()
+
+    with _TOKENS_LOCK:
+        _TOKENS = tokens
+        _TOKENS_LOADED_AT = now
+
+    return tokens
+
+
 def invalidate_token(region):
-    with _TOKEN_LOCK:
-        _TOKEN_CACHE.pop(region, None)
+    global _TOKENS
+    with _TOKENS_LOCK:
+        if _TOKENS:
+            _TOKENS.pop(region, None)
 
 
-# ==================== Fetch ====================
+# ==================== Fetch Player ====================
 def build_body(aid):
-    return enc(fi(1, aid) + fi(2, 1) + fi(3, 1) + fi(4, 1))
+    return enc(fi(1, aid) + fi(2, 1))
 
 
 def try_token(token, aid, region):
@@ -248,7 +327,7 @@ def try_token(token, aid, region):
         "Accept-Encoding": "deflate, gzip",
     }
     try:
-        r = SESSION.post(f"{host}/GetWorkshopAuthorInfo",
+        r = SESSION.post(f"{host}/GetPlayerPersonalShow",
                          headers=h, data=body, timeout=TIMEOUT)
         if r.status_code == 200:
             return parse_resp(r.content)
@@ -258,64 +337,163 @@ def try_token(token, aid, region):
     except: return None
 
 
-def _find_name(o, depth=0):
-    if depth > 6: return None
-    if isinstance(o, dict):
-        for k in ('6', 6, '3', 3):
-            v = o.get(k)
-            if isinstance(v, str) and v and not v.isdigit() and len(v) < 60:
-                return v
-        for v in o.values():
-            r = _find_name(v, depth + 1)
-            if r: return r
-    elif isinstance(o, list):
-        for v in o:
-            r = _find_name(v, depth + 1)
-            if r: return r
-    return None
+# ==================== Extractors ====================
+BR_RANKS = [(0,"Bronze I"),(100,"Bronze II"),(200,"Bronze III"),
+    (300,"Silver I"),(400,"Silver II"),(500,"Silver III"),
+    (600,"Gold I"),(700,"Gold II"),(800,"Gold III"),
+    (900,"Platinum I"),(1000,"Platinum II"),(1100,"Platinum III"),
+    (1200,"Diamond I"),(1300,"Diamond II"),(1400,"Diamond III"),
+    (1500,"Diamond IV"),(1700,"Heroic"),(2000,"Elite Heroic"),
+    (2300,"Master"),(2600,"Elite Master"),(2900,"Grandmaster")]
 
 
-def extract(resp):
-    info = {"account_id": None, "account_name": None, "bio": None,
-            "followers": None, "points": None}
-    top4 = resp.get('4') or resp.get(4)
-    if isinstance(top4, int): info["account_id"] = top4
+def br_rank_name(p):
+    n = "Bronze I"
+    for t, x in BR_RANKS:
+        if p >= t: n = x
+        else: break
+    return n
 
-    f1 = resp.get('1') or resp.get(1)
-    if isinstance(f1, dict):
-        f1_4 = f1.get('4') or f1.get(4)
-        if isinstance(f1_4, dict):
-            if info["account_id"] is None:
-                aid = f1_4.get('2') or f1_4.get(2)
-                if isinstance(aid, int): info["account_id"] = aid
-            nick = f1_4.get('6') or f1_4.get(6)
-            if isinstance(nick, str) and nick: info["account_name"] = nick
 
-    f7 = resp.get('7') or resp.get(7)
-    if isinstance(f7, dict):
-        if info["account_id"] is None:
-            aid = f7.get('1') or f7.get(1)
-            if isinstance(aid, int): info["account_id"] = aid
-        foll = f7.get('2') or f7.get(2)
-        pts  = f7.get('3') or f7.get(3)
-        bio  = f7.get('6') or f7.get(6)
-        if isinstance(foll, int): info["followers"] = foll
-        if isinstance(pts, int):  info["points"]    = pts
-        if isinstance(bio, str):  info["bio"]       = bio
+def cs_rank_name(p):
+    for t, n in [(2900,"Grandmaster"),(2600,"Elite Master"),(2300,"Master"),
+                 (2000,"Elite Heroic"),(1700,"Heroic"),(1500,"Diamond IV"),
+                 (1400,"Diamond III"),(1300,"Diamond II"),(1200,"Diamond I"),
+                 (1100,"Platinum III"),(1000,"Platinum II"),(900,"Platinum I"),
+                 (800,"Gold III"),(700,"Gold II"),(600,"Gold I")]:
+        if p >= t: return n
+    return "Bronze"
 
-    if not info["account_name"]:
-        n = _find_name(resp)
-        if n: info["account_name"] = n
 
-    return info
+PET_NAMES = {
+    1300000001:"Kitty", 1300000002:"Ottero", 1300000003:"Mr. Waggor",
+    1300000004:"Falco", 1300000005:"Robby", 1300000006:"Shiba",
+    1300000007:"Sensei Tig", 1300000008:"Agent Hop", 1300000009:"Beaston",
+}
+
+
+def pet_name(pid):
+    return PET_NAMES.get(pid, f"Pet {pid}")
+
+
+def decode_hex(h):
+    if not isinstance(h, str) or not h: return ""
+    try: return bytes.fromhex(h).decode('utf-8', 'ignore').strip()
+    except: return ""
+
+
+def fmt_ts(ts):
+    if not ts or not isinstance(ts, int): return "N/A"
+    try:
+        return time.strftime("%d %B %Y at %I:%M:%S %p (IST)",
+                             time.gmtime(ts + 5*3600 + 30*60))
+    except: return str(ts)
+
+
+def g(d, k, default=None):
+    if not isinstance(d, dict): return default
+    v = d.get(str(k), d.get(k, default))
+    if isinstance(v, dict) and 'data' in v: return v['data']
+    return v if v is not None else default
+
+
+def extract_info(resp):
+    p = g(resp, 1) or {}
+    uid    = g(p, 1)
+    name   = g(p, 3, "Unknown")
+    region = g(p, 5, "?")
+    level  = g(p, 6, 0)
+    exp    = g(p, 7, 0)
+    likes  = g(p, 21, 0)
+    prime  = g(p, 14, 0)
+    banner = g(p, 11, 0)
+    avatar = g(p, 12, 0)
+    badge  = g(p, 19, 0)
+    br_points = g(p, 15, 0)
+    bp_badges = g(p, 18, 0)
+    season = g(p, 50, "?")
+    created = g(p, 24, 0)
+    last_login = g(p, 44, 0)
+
+    bio_hex = g(g(g(p, 9, {}), 9, {}), 12, "")
+    bio = decode_hex(bio_hex) or "(empty)"
+
+    honor_blk = g(resp, 11, {})
+    honor_score = g(honor_blk, 1, 0) if isinstance(honor_blk, dict) else 0
+
+    cs_blk = g(g(p, 61, {}), 3, {})
+    cs_pts = cs_blk.get('3', 0) if isinstance(cs_blk, dict) else 0
+
+    bp_t = g(g(p, 63, {}), 1, {})
+    bp_type = bp_t.get('1', 0) if isinstance(bp_t, dict) else 0
+    bp_label = {1: "Free", 2: "Premium", 9: "Basic"}.get(bp_type, "Basic")
+
+    pet_out = None
+    pet_blk = g(resp, 8, {})
+    if isinstance(pet_blk, dict) and pet_blk:
+        pid = pet_blk.get('1') or pet_blk.get(1)
+        pet_out = {
+            "id": pid, "name": pet_name(pid),
+            "level": pet_blk.get('3') or pet_blk.get(3),
+            "exp": pet_blk.get('4') or pet_blk.get(4),
+        }
+
+    clan_out = None
+    c = g(resp, 6, {})
+    L = g(resp, 7, {})
+    if isinstance(c, dict) and c:
+        clan_out = {
+            "id": c.get('1') or c.get(1),
+            "name": c.get('2') or c.get(2),
+            "level": c.get('4') or c.get(4),
+            "members_current": c.get('6') or c.get(6),
+            "members_max": c.get('5') or c.get(5),
+        }
+        if isinstance(L, dict) and L:
+            clan_out["leader"] = {
+                "name": L.get('3') or L.get(3),
+                "uid": L.get('1') or L.get(1),
+                "level": L.get('6') or L.get(6),
+            }
+
+    return {
+        "account_id": uid,
+        "account_name": name,
+        "region": region,
+        "level": level,
+        "experience": exp,
+        "prime_level": prime,
+        "likes": likes,
+        "honor_score": honor_score,
+        "created_at": fmt_ts(last_login),
+        "last_login": fmt_ts(created),
+        "season": season,
+        "signature": bio,
+        "ranks": {
+            "br_points": br_points,
+            "br_rank": br_rank_name(br_points),
+            "cs_points": cs_pts,
+            "cs_rank": cs_rank_name(cs_pts),
+        },
+        "cosmetics": {
+            "banner_id": banner,
+            "avatar_id": avatar,
+            "badge_id": badge,
+            "bp_badges": bp_badges,
+            "bp_type": bp_label,
+        },
+        "pet": pet_out,
+        "clan": clan_out,
+    }
 
 
 def fetch_parallel(target):
+    """Try ALL tokens in parallel. First 200 wins."""
     cache = get_tokens()
     if not cache:
         return None, None, None, "no tokens"
 
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=min(WORKERS, len(cache))) as pool:
         futs = {
             pool.submit(try_token, e["token"], target, r): (r, e["uid"])
             for r, e in cache.items()
@@ -325,30 +503,30 @@ def fetch_parallel(target):
             try:
                 resp = f.result()
                 if resp:
-                    return extract(resp), region, uid, None
+                    return extract_info(resp), region, uid, None
             except: continue
 
     return None, None, None, "all failed"
 
 
 def get_cached_response(uid):
-    with _RESPONSE_LOCK:
-        e = _RESPONSE_CACHE.get(uid)
+    with _RESPONSES_LOCK:
+        e = _RESPONSES.get(uid)
         if e and (time.time() - e["ts"]) < _RESPONSE_TTL:
             return e
     return None
 
 
 def set_cached_response(uid, data, region, used_uid):
-    with _RESPONSE_LOCK:
-        _RESPONSE_CACHE[uid] = {
+    with _RESPONSES_LOCK:
+        _RESPONSES[uid] = {
             "data": data, "region": region,
             "used_uid": used_uid, "ts": time.time(),
         }
-        if len(_RESPONSE_CACHE) > 500:
-            oldest = sorted(_RESPONSE_CACHE.items(), key=lambda x: x[1]["ts"])[:100]
+        if len(_RESPONSES) > 1000:
+            oldest = sorted(_RESPONSES.items(), key=lambda x: x[1]["ts"])[:200]
             for k, _ in oldest:
-                _RESPONSE_CACHE.pop(k, None)
+                _RESPONSES.pop(k, None)
 
 
 # ==================== Hooks ====================
@@ -368,17 +546,18 @@ def _log(response):
     return response
 
 
-# ==================== Endpoints ====================
+# ==================== ENDPOINTS ====================
 @app.route('/get', methods=['GET'])
-@app.route('/followers', methods=['GET'])
+@app.route('/info', methods=['GET'])
 def get_info():
-    uid_in = (request.args.get('follower')
+    uid_in = (request.args.get('info')
               or request.args.get('uid')
-              or request.args.get('info')
+              or request.args.get('follower')
               or '').strip()
 
     if not uid_in or not uid_in.isdigit():
         return jsonify({"success": False, "error": "uid required",
+                        "example": "/get?info=1901614992",
                         "credit": CREDIT}), 400
 
     target = int(uid_in)
@@ -391,7 +570,7 @@ def get_info():
             "success": True,
             "region": cached["region"],
             "used_uid": cached["used_uid"],
-            "token_source": "cache",
+            "token_source": "response_cache",
             "time_sec": round(time.time() - t0, 3),
             "data": cached["data"],
             "credit": CREDIT,
@@ -403,21 +582,13 @@ def get_info():
     if not info:
         return jsonify({
             "success": False,
-            "error": "workshop_fetch_failed",
+            "error": "player_fetch_failed",
             "detail": err,
             "time_sec": elapsed,
             "credit": CREDIT,
         }), 502
 
-    data = {
-        "account_id": info["account_id"],
-        "account_name": info["account_name"],
-        "bio": info["bio"],
-        "followers": info["followers"],
-        "points": info["points"],
-    }
-
-    set_cached_response(target, data, region, used_uid)
+    set_cached_response(target, info, region, used_uid)
 
     return jsonify({
         "success": True,
@@ -425,45 +596,41 @@ def get_info():
         "used_uid": used_uid,
         "token_source": "parallel",
         "time_sec": elapsed,
-        "data": data,
+        "data": info,
         "credit": CREDIT,
     })
 
 
-@app.route('/token/refresh', methods=['GET'])
-def refresh_tokens():
-    with _TOKEN_LOCK:
-        _TOKEN_CACHE.clear()
+@app.route('/tokens/reload', methods=['GET'])
+def reload_tokens():
+    """Force reload tokens from token.json."""
+    global _TOKENS, _TOKENS_LOADED_AT
+    with _TOKENS_LOCK:
+        _TOKENS = None
+        _TOKENS_LOADED_AT = 0
     cache = get_tokens()
     return jsonify({
         "success": True,
-        "refreshed": len(cache),
+        "reloaded": len(cache),
         "tokens": [{"uid": e["uid"], "region": r, "expires_in_min": e["remaining_min"]}
                    for r, e in cache.items()],
         "credit": CREDIT,
     })
 
 
-@app.route('/token/status', methods=['GET'])
+@app.route('/tokens/status', methods=['GET'])
 def token_status():
     cache = get_tokens()
+    path = find_token_file()
     return jsonify({
         "success": True,
-        "total_regions": len(JWT_ACCOUNTS),
+        "token_file": path or "(not found)",
         "cached_regions": len(cache),
-        "missing": [r for r in JWT_ACCOUNTS if r not in cache],
         "tokens": [{"uid": e["uid"], "region": r, "expires_in_min": e["remaining_min"]}
                    for r, e in cache.items()],
-        "response_cache_size": len(_RESPONSE_CACHE),
+        "response_cache_size": len(_RESPONSES),
         "credit": CREDIT,
     })
-
-
-@app.route('/token/clear', methods=['GET'])
-def clear_tokens():
-    with _TOKEN_LOCK: _TOKEN_CACHE.clear()
-    with _RESPONSE_LOCK: _RESPONSE_CACHE.clear()
-    return jsonify({"success": True, "message": "cleared", "credit": CREDIT})
 
 
 @app.route('/metrics', methods=['GET'])
@@ -485,21 +652,32 @@ def metrics():
 
 @app.route('/', methods=['GET'])
 def home():
+    cache = get_tokens()
     return jsonify({
-        "name": "Ultra-Fast Workshop API",
+        "name": "Ultra-Fast Info API",
         "version": VERSION,
+        "token_file": find_token_file() or "(missing)",
+        "cached_tokens": len(cache),
         "endpoints": {
-            "/get?follower={uid}": "Get followers + info",
-            "/followers?uid={uid}": "Alias",
-            "/token/refresh": "Refresh tokens",
-            "/token/status": "Cache status",
-            "/token/clear": "Clear cache",
+            "/get?info={uid}": "Get full player info",
+            "/info?uid={uid}": "Alias",
+            "/tokens/reload": "Reload token.json",
+            "/tokens/status": "Token cache status",
             "/metrics": "Server metrics",
         },
         "credit": CREDIT,
     })
 
 
+# ==================== Startup ====================
+print(f"\n⚡ Ultra-Fast Info API v{VERSION}")
+print(f"   Token file: {find_token_file() or '(not found)'}\n")
+try:
+    initial = get_tokens()
+    print(f"   ✅ Loaded {len(initial)} tokens\n")
+except Exception as e:
+    print(f"   ⚠️  Initial load: {e}\n")
+
+
 if __name__ == '__main__':
-    print(f"\n⚡ Ultra-Fast Workshop API v{VERSION}\n")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
