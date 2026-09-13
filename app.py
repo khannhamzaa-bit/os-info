@@ -12,9 +12,9 @@ app = Flask(__name__)
 JWT_API = "https://os-jwt-access.vercel.app/jwt?uid={uid}&password={password}"
 TOKEN_FILE = os.environ.get("TOKEN_FILE", "token.json")
 CREDIT = "https://t.me/os_codex"
-VERSION = "5.0"
+VERSION = "6.0"
 
-# ==================== ACCOUNTS (fallback if token.json missing) ====================
+# ==================== ACCOUNTS (fallback) ====================
 JWT_ACCOUNTS = {
     "IND": [
         {"uid": "4712787314", "password": "A3C9F7C0F8FEED9C9C0E7714BF14F8E5C26D0502687F4548394C1905C1728293"},
@@ -79,7 +79,7 @@ SESSION.mount("https://", _adapter)
 TIMEOUT = 5
 WORKERS = 20
 
-# ==================== Module-Level Caches ====================
+# ==================== Caches ====================
 _TOKENS = None
 _TOKENS_LOADED_AT = 0
 _TOKENS_LOCK = threading.Lock()
@@ -90,6 +90,31 @@ _RESPONSES_LOCK = threading.Lock()
 _RESPONSE_TTL = 1800
 
 _METRICS = {"total": 0, "success": 0, "fail": 0, "cache_hit": 0, "time": 0.0}
+
+# ==================== Static Maps ====================
+BR_RANKS = [(0,"Bronze I"),(100,"Bronze II"),(200,"Bronze III"),
+    (300,"Silver I"),(400,"Silver II"),(500,"Silver III"),
+    (600,"Gold I"),(700,"Gold II"),(800,"Gold III"),
+    (900,"Platinum I"),(1000,"Platinum II"),(1100,"Platinum III"),
+    (1200,"Diamond I"),(1300,"Diamond II"),(1400,"Diamond III"),
+    (1500,"Diamond IV"),(1700,"Heroic"),(2000,"Elite Heroic"),
+    (2300,"Master"),(2600,"Elite Master"),(2900,"Grandmaster")]
+
+PET_NAMES = {
+    1300000001:"Kitty", 1300000002:"Ottero", 1300000003:"Mr. Waggor",
+    1300000004:"Falco", 1300000005:"Robby", 1300000006:"Shiba",
+    1300000007:"Sensei Tig", 1300000008:"Agent Hop", 1300000009:"Beaston",
+}
+GENDER_MAP = {0: "None", 1: "Male", 2: "Female", 3: "Confidential"}
+LANGUAGE_MAP = {0: "None", 1: "English", 2: "Chinese (Simplified)", 3: "Chinese (Traditional)",
+                4: "Thai", 5: "Vietnamese", 6: "Indonesian", 7: "Portuguese",
+                8: "Spanish", 9: "Russian", 10: "Korean", 11: "French",
+                12: "German", 13: "Turkish", 14: "Hindi", 15: "Japanese"}
+MODE_PREFER_MAP = {0: "None", 1: "BR", 2: "CS", 3: "Entertainment"}
+RANK_SHOW_MAP = {0: "None", 1: "BR", 2: "CS"}
+VETERAN_MAP = {0: "None", 1: "Short", 2: "Normal", 3: "Long", 4: "Very Long"}
+TIME_ONLINE_MAP = {0: "None", 1: "Workday", 2: "Weekend"}
+TIME_ACTIVE_MAP = {0: "None", 1: "Morning", 2: "Afternoon", 3: "Night"}
 
 
 def log(tag, msg):
@@ -168,7 +193,7 @@ def parse_resp(raw):
     except: return {}
 
 
-# ==================== JWT Helpers ====================
+# ==================== JWT ====================
 def decode_jwt(j):
     try:
         s = j.split('.')[1]; s += '=' * (-len(s) % 4)
@@ -186,9 +211,8 @@ def jwt_region(j):
             or p.get('lock_region') or 'IND').upper()
 
 
-# ==================== Token File Loader ====================
+# ==================== Token Loader ====================
 def find_token_file():
-    """Try multiple paths to locate token.json."""
     paths = [
         os.environ.get("TOKEN_FILE", ""),
         "token.json",
@@ -205,17 +229,13 @@ def find_token_file():
 
 
 def load_tokens_from_file():
-    """Load tokens from token.json. Returns {region: entry} dict."""
     path = find_token_file()
     if not path:
-        log("TOKEN", "no token.json found")
         return {}
-
     try:
         with open(path) as f:
             data = json.load(f)
-    except Exception as e:
-        log("TOKEN", f"parse error: {e}")
+    except Exception:
         return {}
 
     entries = data if isinstance(data, list) else [data]
@@ -226,26 +246,18 @@ def load_tokens_from_file():
         if not isinstance(e, dict): continue
         tok = e.get("token")
         if not tok: continue
-
         exp = jwt_exp(tok) or int(e.get("expires_at") or 0)
-        if not exp or now >= (exp - 300):
-            continue
-
+        if not exp or now >= (exp - 300): continue
         region = (e.get("region") or jwt_region(tok)).upper()
         tokens[region] = {
-            "uid": e.get("uid"),
-            "token": tok,
-            "region": region,
-            "exp": exp,
-            "remaining_min": (exp - now) // 60,
+            "uid": e.get("uid"), "token": tok, "region": region,
+            "exp": exp, "remaining_min": (exp - now) // 60,
         }
-
     log("TOKEN", f"loaded {len(tokens)} tokens from {path}")
     return tokens
 
 
-def fetch_token_fallback(uid, password):
-    """Fallback: fetch JWT directly from API."""
+def fetch_jwt(uid, password):
     try:
         r = SESSION.get(JWT_API.format(uid=uid, password=password), timeout=TIMEOUT)
         if r.status_code != 200: return None
@@ -258,10 +270,9 @@ def fetch_token_fallback(uid, password):
 
 
 def fetch_all_fallback():
-    """Fetch all tokens from JWT API in parallel (only if file missing)."""
     def fetch_region(region, accounts):
         for acc in accounts:
-            tok = fetch_token_fallback(acc["uid"], acc["password"])
+            tok = fetch_jwt(acc["uid"], acc["password"])
             if tok:
                 exp = jwt_exp(tok)
                 return region, {
@@ -270,7 +281,6 @@ def fetch_all_fallback():
                 }
         return region, None
 
-    log("TOKEN", "fetching from JWT API (no file)")
     results = {}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futs = {pool.submit(fetch_region, r, JWT_ACCOUNTS[r]): r for r in JWT_ACCOUNTS}
@@ -282,9 +292,7 @@ def fetch_all_fallback():
 
 
 def get_tokens():
-    """Return tokens — from file cache, or fetch fresh."""
     global _TOKENS, _TOKENS_LOADED_AT
-
     now = time.time()
     with _TOKENS_LOCK:
         if _TOKENS and (now - _TOKENS_LOADED_AT) < _TOKENS_TTL:
@@ -297,7 +305,6 @@ def get_tokens():
     with _TOKENS_LOCK:
         _TOKENS = tokens
         _TOKENS_LOADED_AT = now
-
     return tokens
 
 
@@ -337,16 +344,7 @@ def try_token(token, aid, region):
     except: return None
 
 
-# ==================== Extractors ====================
-BR_RANKS = [(0,"Bronze I"),(100,"Bronze II"),(200,"Bronze III"),
-    (300,"Silver I"),(400,"Silver II"),(500,"Silver III"),
-    (600,"Gold I"),(700,"Gold II"),(800,"Gold III"),
-    (900,"Platinum I"),(1000,"Platinum II"),(1100,"Platinum III"),
-    (1200,"Diamond I"),(1300,"Diamond II"),(1400,"Diamond III"),
-    (1500,"Diamond IV"),(1700,"Heroic"),(2000,"Elite Heroic"),
-    (2300,"Master"),(2600,"Elite Master"),(2900,"Grandmaster")]
-
-
+# ==================== Rank Helpers ====================
 def br_rank_name(p):
     n = "Bronze I"
     for t, x in BR_RANKS:
@@ -363,13 +361,6 @@ def cs_rank_name(p):
                  (800,"Gold III"),(700,"Gold II"),(600,"Gold I")]:
         if p >= t: return n
     return "Bronze"
-
-
-PET_NAMES = {
-    1300000001:"Kitty", 1300000002:"Ottero", 1300000003:"Mr. Waggor",
-    1300000004:"Falco", 1300000005:"Robby", 1300000006:"Shiba",
-    1300000007:"Sensei Tig", 1300000008:"Agent Hop", 1300000009:"Beaston",
-}
 
 
 def pet_name(pid):
@@ -390,6 +381,23 @@ def fmt_ts(ts):
     except: return str(ts)
 
 
+def humanize_ago(ts):
+    if not ts or not isinstance(ts, int): return "N/A"
+    try:
+        diff = int(time.time()) - ts
+        if diff < 0: return "in the future"
+        if diff < 60: return "just now"
+        days = diff // 86400
+        hrs = (diff % 86400) // 3600
+        mins = (diff % 3600) // 60
+        parts = []
+        if days: parts.append(f"{days} days")
+        if hrs: parts.append(f"{hrs} hr")
+        if mins and not days: parts.append(f"{mins} min")
+        return (" ".join(parts) + " ago") if parts else "just now"
+    except: return "N/A"
+
+
 def g(d, k, default=None):
     if not isinstance(d, dict): return default
     v = d.get(str(k), d.get(k, default))
@@ -397,47 +405,107 @@ def g(d, k, default=None):
     return v if v is not None else default
 
 
-def extract_info(resp):
+# ==================== FULL RESPONSE BUILDER ====================
+def build_full_report(resp):
     p = g(resp, 1) or {}
-    uid    = g(p, 1)
-    name   = g(p, 3, "Unknown")
+
+    # ----- BASIC -----
+    uid = g(p, 1)
+    nickname = g(p, 3, "Unknown")
+    external_id = g(p, 4)
     region = g(p, 5, "?")
-    level  = g(p, 6, 0)
-    exp    = g(p, 7, 0)
-    likes  = g(p, 21, 0)
-    prime  = g(p, 14, 0)
-    banner = g(p, 11, 0)
-    avatar = g(p, 12, 0)
-    badge  = g(p, 19, 0)
-    br_points = g(p, 15, 0)
-    bp_badges = g(p, 18, 0)
-    season = g(p, 50, "?")
+    level = g(p, 6, 0)
+    exp = g(p, 7, 0)
+    prime_level = g(p, 14, 0)
+    likes = g(p, 21, 0)
     created = g(p, 24, 0)
     last_login = g(p, 44, 0)
-
+    season = g(p, 50, "?")
     bio_hex = g(g(g(p, 9, {}), 9, {}), 12, "")
     bio = decode_hex(bio_hex) or "(empty)"
 
-    honor_blk = g(resp, 11, {})
-    honor_score = g(honor_blk, 1, 0) if isinstance(honor_blk, dict) else 0
-
+    # ----- RANKS -----
+    br_points = g(p, 15, 0)
     cs_blk = g(g(p, 61, {}), 3, {})
     cs_pts = cs_blk.get('3', 0) if isinstance(cs_blk, dict) else 0
+    cs_stars = cs_blk.get('4', 0) if isinstance(cs_blk, dict) else 0
+    rank_blk = g(p, 49, {})
+    show_br = g(rank_blk, 2, 0) if isinstance(rank_blk, dict) else 0
+    show_cs = g(rank_blk, 3, 0) if isinstance(rank_blk, dict) else 0
 
+    # ----- SOCIAL -----
+    social = g(p, 9, {}) or {}
+    social_9 = g(social, 9, {}) or {}
+    gender_id = g(social_9, 2, 0)
+    language_id = g(social_9, 3, 0)
+    time_online_id = g(social_9, 4, 0)
+    time_active_id = g(social_9, 5, 0)
+    battle_tags = g(social_9, 6) or []
+    social_tags = g(social_9, 7) or []
+    mode_prefer_id = g(social_9, 8, 0)
+    rank_show_id = g(social_9, 10, 0)
+
+    # ----- CREDIT -----
+    credit_blk = g(resp, 11, {}) or {}
+    credit_score = g(credit_blk, 1, 0) if isinstance(credit_blk, dict) else 0
+    weekly_matches = g(credit_blk, 6, 0) if isinstance(credit_blk, dict) else 0
+
+    # ----- BOOYAH PASS -----
     bp_t = g(g(p, 63, {}), 1, {})
-    bp_type = bp_t.get('1', 0) if isinstance(bp_t, dict) else 0
-    bp_label = {1: "Free", 2: "Premium", 9: "Basic"}.get(bp_type, "Basic")
+    if isinstance(bp_t, dict) and bp_t:
+        bp_event_id = bp_t.get('1') or bp_t.get(1)
+        bp_owned = bool(bp_t.get('2') or bp_t.get(2))
+        bp_badge = bp_t.get('3') or bp_t.get(3)
+        bp_badge_count = bp_t.get('4') or bp_t.get(4)
+        bp_max_level = bp_t.get('6') or bp_t.get(6)
+        bp_name = bp_t.get('7') or bp_t.get(7)
+    else:
+        bp_event_id = bp_badge = bp_badge_count = bp_max_level = None
+        bp_owned = False
+        bp_name = None
+    bp_label = "Premium" if bp_owned else "Free"
 
+    # ----- COSMETICS -----
+    banner_id = g(p, 11, 0)
+    badge_id = g(p, 19, 0)
+    pin_id = g(p, 33, 0)
+    weapon_skins = g(p, 32)
+    veteran_tag = g(p, 66, 0)
+    season_id = g(p, 20, 0)
+    bp_badges = g(p, 18, 0)
+
+    # ----- EQUIPPED (from field 2 = profile) -----
+    profile = g(resp, 2, {})
+    equipped = {
+        "avatar_id": None,
+        "clothes": {},
+        "equipped_skills": {},
+        "top": None, "bottom": None, "mask": None,
+        "facepaint": None, "shoes": None,
+    }
+    if isinstance(profile, dict):
+        equipped["avatar_id"] = profile.get('1') or profile.get(1)
+        equipped["clothes"] = profile.get('4') or profile.get(4)
+        equipped["equipped_skills"] = profile.get('5') or profile.get(5)
+        equipped["top"] = profile.get('14') or profile.get(14)
+        equipped["bottom"] = profile.get('15') or profile.get(15)
+        equipped["mask"] = profile.get('16') or profile.get(16)
+        equipped["facepaint"] = profile.get('17') or profile.get(17)
+        equipped["shoes"] = profile.get('18') or profile.get(18)
+
+    # ----- PET -----
     pet_out = None
     pet_blk = g(resp, 8, {})
     if isinstance(pet_blk, dict) and pet_blk:
         pid = pet_blk.get('1') or pet_blk.get(1)
         pet_out = {
-            "id": pid, "name": pet_name(pid),
+            "id": pid,
+            "name": pet_name(pid),
             "level": pet_blk.get('3') or pet_blk.get(3),
             "exp": pet_blk.get('4') or pet_blk.get(4),
         }
 
+    # ----- CLAN -----
     clan_out = None
     c = g(resp, 6, {})
     L = g(resp, 7, {})
@@ -456,39 +524,98 @@ def extract_info(resp):
                 "level": L.get('6') or L.get(6),
             }
 
+    # ----- CRAFTLAND -----
+    craftland = None
+    try:
+        f41 = g(p, 41, {})
+        if isinstance(f41, dict):
+            f9 = f41.get('9') or f41.get(9)
+            if isinstance(f9, dict):
+                craftland = f9.get('25') or f9.get(25)
+    except: pass
+
+    # ----- ACHIEVEMENTS -----
+    achievements = []
+    ach_blk = g(resp, 13) or g(p, 13)
+    if isinstance(ach_blk, list):
+        for a in ach_blk:
+            if isinstance(a, dict):
+                achievements.append({
+                    "id": a.get('1') or a.get(1),
+                    "level": a.get('2') or a.get(2),
+                })
+
+    # ===== FINAL ASSEMBLY (same as old) =====
     return {
-        "account_id": uid,
-        "account_name": name,
-        "region": region,
-        "level": level,
-        "experience": exp,
-        "prime_level": prime,
-        "likes": likes,
-        "honor_score": honor_score,
-        "created_at": fmt_ts(last_login),
-        "last_login": fmt_ts(created),
-        "season": season,
-        "signature": bio,
+        "achievements": achievements,
+        "basic": {
+            "created_ago": humanize_ago(last_login),       # swapped
+            "created_at": fmt_ts(last_login),               # swapped
+            "exp": exp,
+            "external_id": external_id,
+            "last_login": fmt_ts(created),                  # swapped
+            "last_login_ago": humanize_ago(created),        # swapped
+            "level": level,
+            "likes": likes,
+            "nickname": nickname,
+            "prime_level": prime_level,
+            "region": region,
+            "season": season,
+            "signature": bio,
+            "title": "Not Equipped",
+            "uid": uid,
+        },
+        "booyah_pass": {
+            "badge": bp_badge,
+            "badge_count": bp_badge_count,
+            "event_id": bp_event_id,
+            "event_name": bp_name,
+            "max_level": bp_max_level,
+            "owned": bp_owned,
+            "type": bp_label,
+        },
+        "clan": clan_out,
+        "cosmetics": {
+            "avatar_id": banner_id,
+            "badge_id": badge_id,
+            "banner_id": banner_id,
+            "bp_badges": bp_badges,
+            "pin_id": pin_id,
+            "season_id": season_id,
+            "veteran_tag": VETERAN_MAP.get(veteran_tag, "None"),
+            "weapon_skins": weapon_skins,
+        },
+        "craftland_map": craftland,
+        "credit": {
+            "credit_score": credit_score,
+            "weekly_matches": weekly_matches,
+        },
+        "equipped": equipped,
+        "pet": pet_out,
         "ranks": {
             "br_points": br_points,
             "br_rank": br_rank_name(br_points),
             "cs_points": cs_pts,
             "cs_rank": cs_rank_name(cs_pts),
+            "cs_stars": cs_stars,
+            "show_br": bool(show_br),
+            "show_cs": bool(show_cs),
+            "show_rank": RANK_SHOW_MAP.get(rank_show_id, "None"),
         },
-        "cosmetics": {
-            "banner_id": banner,
-            "avatar_id": avatar,
-            "badge_id": badge,
-            "bp_badges": bp_badges,
-            "bp_type": bp_label,
+        "social": {
+            "battle_tags": battle_tags,
+            "gender": GENDER_MAP.get(gender_id, "None"),
+            "language": LANGUAGE_MAP.get(language_id, "None"),
+            "mode_prefer": MODE_PREFER_MAP.get(mode_prefer_id, "None"),
+            "social_tags": social_tags,
+            "time_active": TIME_ACTIVE_MAP.get(time_active_id, "None"),
+            "time_online": TIME_ONLINE_MAP.get(time_online_id, "None"),
         },
-        "pet": pet_out,
-        "clan": clan_out,
     }
 
 
+# ==================== Parallel Fetch ====================
 def fetch_parallel(target):
-    """Try ALL tokens in parallel. First 200 wins."""
     cache = get_tokens()
     if not cache:
         return None, None, None, "no tokens"
@@ -503,7 +630,7 @@ def fetch_parallel(target):
             try:
                 resp = f.result()
                 if resp:
-                    return extract_info(resp), region, uid, None
+                    return build_full_report(resp), region, uid, None
             except: continue
 
     return None, None, None, "all failed"
@@ -556,9 +683,12 @@ def get_info():
               or '').strip()
 
     if not uid_in or not uid_in.isdigit():
-        return jsonify({"success": False, "error": "uid required",
-                        "example": "/get?info=1901614992",
-                        "credit": CREDIT}), 400
+        return jsonify({
+            "success": False,
+            "error": "uid required",
+            "example": "/get?info=1901614992",
+            "credit": CREDIT,
+        }), 400
 
     target = int(uid_in)
     t0 = time.time()
@@ -603,7 +733,6 @@ def get_info():
 
 @app.route('/tokens/reload', methods=['GET'])
 def reload_tokens():
-    """Force reload tokens from token.json."""
     global _TOKENS, _TOKENS_LOADED_AT
     with _TOKENS_LOCK:
         _TOKENS = None
@@ -654,12 +783,12 @@ def metrics():
 def home():
     cache = get_tokens()
     return jsonify({
-        "name": "Ultra-Fast Info API",
+        "name": "Fast Player Info API",
         "version": VERSION,
         "token_file": find_token_file() or "(missing)",
         "cached_tokens": len(cache),
         "endpoints": {
-            "/get?info={uid}": "Get full player info",
+            "/get?info={uid}": "Full player info",
             "/info?uid={uid}": "Alias",
             "/tokens/reload": "Reload token.json",
             "/tokens/status": "Token cache status",
@@ -670,13 +799,13 @@ def home():
 
 
 # ==================== Startup ====================
-print(f"\n⚡ Ultra-Fast Info API v{VERSION}")
-print(f"   Token file: {find_token_file() or '(not found)'}\n")
+print(f"\n⚡ Fast Player Info API v{VERSION}")
+print(f"   Token file: {find_token_file() or '(not found)'}")
 try:
     initial = get_tokens()
     print(f"   ✅ Loaded {len(initial)} tokens\n")
 except Exception as e:
-    print(f"   ⚠️  Initial load: {e}\n")
+    print(f"   ⚠️  Init: {e}\n")
 
 
 if __name__ == '__main__':
