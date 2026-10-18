@@ -21,6 +21,7 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.json.ensure_ascii = False          # ⬅️ print real Unicode names (SʏɴᴛᴀxX࿗࿌)
 
 # ------------------ File Loading ------------------
 BASE_DIR = Path(__file__).parent
@@ -209,7 +210,7 @@ def direct_ff_call(encrypted_hex, region, method="GetPlayerPersonalShow"):
         'Authorization': f'Bearer {token}',
         'X-Unity-Version': '2018.4.11f1',
         'X-GA': 'v1 1',
-        'ReleaseVersion': 'OB55',        # ⬅️ UPDATED: OB54 → OB55
+        'ReleaseVersion': 'OB55',
         'Content-Type': 'application/x-www-form-urlencoded',
     }
     r = http_session.post(url, headers=headers,
@@ -265,7 +266,56 @@ def home():
         "endpoints": {
             "info": "/info?uid={uid}",
             "wishlist": "/wishlist?uid={uid}&region=BD",
+            "accounts": "/accounts",
         },
+    })
+
+
+@app.route('/accounts', methods=['GET'])
+def list_accounts():
+    """
+    Print every loaded account.
+    Passwords are masked (first 6 + … + last 4 chars).
+    Use ?show=1 to reveal full passwords.
+    """
+    show_passwords = request.args.get('show') == '1'
+
+    def mask(pwd):
+        if not pwd:
+            return ""
+        if show_passwords or len(pwd) <= 10:
+            return pwd
+        return f"{pwd[:6]}…{pwd[-4:]}"
+
+    # Group tokens (unique per region) alongside accounts
+    result = {}
+    for region in QUERY_REGIONS:
+        result[region] = {
+            "tokens": [
+                {
+                    "uid": t.get("uid"),
+                    "expires_at": t.get("expires_at"),
+                    "valid": time.time() < t.get("expires_at", 0),
+                    "token_preview": (t.get("token", "")[:20] + "…") if t.get("token") else None,
+                }
+                for t in REGION_TOKENS.get(region, [])
+            ],
+            "accounts": [
+                {"uid": a.get("uid"), "password": mask(a.get("password", ""))}
+                for a in ACCOUNTS.get(region, [])
+            ],
+            "cached_token": bool(jwt_cache.get(region)),
+        }
+
+    total_tokens = sum(len(v) for v in REGION_TOKENS.values())
+    total_accounts = sum(len(v) for v in ACCOUNTS.values())
+
+    return jsonify({
+        "version": "OB55",
+        "total_tokens": total_tokens,
+        "total_accounts": total_accounts,
+        "password_visible": show_passwords,
+        "regions": result,
     })
 
 
