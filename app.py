@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.json.ensure_ascii = False          # ⬅️ print real Unicode names (SʏɴᴛᴀxX࿗࿌)
+app.json.ensure_ascii = False          # print real Unicode names
 
 # ------------------ File Loading ------------------
 BASE_DIR = Path(__file__).parent
@@ -254,6 +254,24 @@ def lookup_all_regions(uid):
     return None
 
 
+# ------------------ Likes Extraction Helper ------------------
+def _extract_likes(basic):
+    """
+    Tries multiple possible field names for the 'likes' count
+    since protobuf field naming varies between data_pb2.py versions.
+    """
+    for key in ("liked", "likes", "likes_count", "like_count", "total_likes"):
+        val = basic.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            return val
+    # If none found as int, try to parse from string
+    for key in ("liked", "likes", "likes_count"):
+        val = basic.get(key)
+        if isinstance(val, str) and val.isdigit():
+            return int(val)
+    return 0
+
+
 # ------------------ Flask Routes ------------------
 @app.route('/', methods=['GET'])
 def home():
@@ -273,11 +291,6 @@ def home():
 
 @app.route('/accounts', methods=['GET'])
 def list_accounts():
-    """
-    Print every loaded account.
-    Passwords are masked (first 6 + … + last 4 chars).
-    Use ?show=1 to reveal full passwords.
-    """
     show_passwords = request.args.get('show') == '1'
 
     def mask(pwd):
@@ -287,7 +300,6 @@ def list_accounts():
             return pwd
         return f"{pwd[:6]}…{pwd[-4:]}"
 
-    # Group tokens (unique per region) alongside accounts
     result = {}
     for region in QUERY_REGIONS:
         result[region] = {
@@ -307,13 +319,10 @@ def list_accounts():
             "cached_token": bool(jwt_cache.get(region)),
         }
 
-    total_tokens = sum(len(v) for v in REGION_TOKENS.values())
-    total_accounts = sum(len(v) for v in ACCOUNTS.values())
-
     return jsonify({
         "version": "OB55",
-        "total_tokens": total_tokens,
-        "total_accounts": total_accounts,
+        "total_tokens": sum(len(v) for v in REGION_TOKENS.values()),
+        "total_accounts": sum(len(v) for v in ACCOUNTS.values()),
         "password_visible": show_passwords,
         "regions": result,
     })
@@ -338,11 +347,20 @@ def info():
     if not basic:
         return jsonify({"error": f"Player {uid_int} not found in any region"}), 404
 
+    # ---- Extract likes with fallbacks ----
+    likes = _extract_likes(basic)
+
+    # Optional debug (comment out in production)
+    if request.args.get('debug') == '1':
+        logger.info(f"[DEBUG] basic_info keys: {list(basic.keys())}")
+        logger.info(f"[DEBUG] basic_info: {basic}")
+
     return jsonify({
         "account_id": basic.get("account_id"),
         "level":      basic.get("level"),
         "region":     basic.get("region"),
         "name":       basic.get("nickname"),
+        "likes":      likes,
     })
 
 
