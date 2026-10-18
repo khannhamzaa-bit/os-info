@@ -37,23 +37,16 @@ def _load_json(name, default):
         logger.error(f"[FILE] Failed to load {name}: {e}")
         return default
 
-# token.json → list of {token, region, uid, expires_at}
 RAW_TOKENS = _load_json("token.json", [])
-
-# accounts.json → {region: [{uid, password}, ...]}
 RAW_ACCOUNTS = _load_json("accounts.json", {})
 
-# Index tokens by region
 REGION_TOKENS = {}
 for t in RAW_TOKENS:
     r = (t.get("region") or t.get("expected_region") or "").upper()
     if r and t.get("token"):
         REGION_TOKENS.setdefault(r, []).append(t)
 
-# Normalize accounts keys to upper
 ACCOUNTS = {k.upper(): v for k, v in RAW_ACCOUNTS.items()}
-
-# Regions to query = anything we have a token OR credentials for
 QUERY_REGIONS = sorted(set(REGION_TOKENS.keys()) | set(ACCOUNTS.keys()))
 
 logger.info(f"[BOOT] Loaded {sum(len(v) for v in REGION_TOKENS.values())} tokens across {list(REGION_TOKENS.keys())}")
@@ -77,7 +70,7 @@ http_session = create_http_session()
 
 # ------------------ Token Refresh API ------------------
 TOKEN_API_BASE = "https://ff-jwt-gen-api.lovable.app/api/public/token"
-JWT_TTL = 600  # 10 min cache for freshly fetched tokens
+JWT_TTL = 600
 
 jwt_cache  = {}
 jwt_expiry = {}
@@ -100,13 +93,6 @@ def _fetch_token_live(uid, password):
 
 
 def get_token_for_region(region):
-    """
-    Priority order:
-      1. In-memory cache (freshly fetched, valid)
-      2. token.json entry that hasn't expired
-      3. Fresh fetch from lovable.app using accounts.json credentials
-      4. None
-    """
     now = time.time()
 
     if region in jwt_cache and now < jwt_expiry.get(region, 0):
@@ -116,14 +102,11 @@ def get_token_for_region(region):
         if region in jwt_cache and now < jwt_expiry.get(region, 0):
             return jwt_cache[region]
 
-        # --- 1) Pick best valid token from token.json ---
-        best_tok = None
-        best_exp = 0
+        best_tok, best_exp = None, 0
         for entry in REGION_TOKENS.get(region, []):
             exp = entry.get("expires_at", 0)
             if exp > now and exp > best_exp:
-                best_tok = entry["token"]
-                best_exp = exp
+                best_tok, best_exp = entry["token"], exp
 
         if best_tok:
             jwt_cache[region] = best_tok
@@ -131,7 +114,6 @@ def get_token_for_region(region):
             logger.info(f"[TOKEN] {region} ← token.json (valid {int(best_exp-now)}s)")
             return best_tok
 
-        # --- 2) Fetch fresh from lovable.app using accounts.json ---
         for cred in ACCOUNTS.get(region, []):
             tok = _fetch_token_live(cred["uid"], cred["password"])
             if tok:
@@ -140,9 +122,7 @@ def get_token_for_region(region):
                 logger.info(f"[TOKEN] {region} ← fresh fetch (uid={cred['uid']})")
                 return tok
 
-        logger.error(f"[TOKEN] No valid token for {region} "
-                     f"(tokens={len(REGION_TOKENS.get(region,[]))}, "
-                     f"accounts={len(ACCOUNTS.get(region,[]))})")
+        logger.error(f"[TOKEN] No valid token for {region}")
         return None
 
 
@@ -229,7 +209,7 @@ def direct_ff_call(encrypted_hex, region, method="GetPlayerPersonalShow"):
         'Authorization': f'Bearer {token}',
         'X-Unity-Version': '2018.4.11f1',
         'X-GA': 'v1 1',
-        'ReleaseVersion': 'OB54',
+        'ReleaseVersion': 'OB55',        # ⬅️ UPDATED: OB54 → OB55
         'Content-Type': 'application/x-www-form-urlencoded',
     }
     r = http_session.post(url, headers=headers,
@@ -278,6 +258,7 @@ def lookup_all_regions(uid):
 def home():
     return jsonify({
         "status": "running",
+        "version": "OB55",
         "query_regions": QUERY_REGIONS,
         "tokens_loaded": {r: len(v) for r, v in REGION_TOKENS.items()},
         "accounts_loaded": {r: len(v) for r, v in ACCOUNTS.items()},
