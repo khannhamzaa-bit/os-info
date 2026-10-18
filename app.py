@@ -1,812 +1,450 @@
-from flask import Flask, request, jsonify, g
-import json, os, time, base64, requests, threading
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from Crypto.Util.Padding import pad
+import binascii
+import requests
+from flask import Flask, jsonify, request
+import threading
+import time
+import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from data_pb2 import AccountPersonalShowInfo
+from google.protobuf.descriptor import FieldDescriptor
+import uid_generator_pb2
+import GetWishListItems_pb2
+
+# ------------------ Logging Setup ------------------
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ==================== CONFIG ====================
-JWT_API = "https://os-jwt-access.vercel.app/jwt?uid={uid}&password={password}"
-TOKEN_FILE = os.environ.get("TOKEN_FILE", "token.json")
-CREDIT = "https://t.me/os_codex"
-VERSION = "6.0"
+# ------------------ JWT Cache ------------------
+jwt_tokens = {}
+jwt_expiry = {}
+jwt_lock = threading.Lock()
 
-# ==================== ACCOUNTS (fallback) ====================
-JWT_ACCOUNTS = {
-    "IND": [
-        {"uid": "4712787314", "password": "A3C9F7C0F8FEED9C9C0E7714BF14F8E5C26D0502687F4548394C1905C1728293"},
-        {"uid": "4296688743", "password": "83D7FB3512DDEC7E50223F08F2CDC6CE0ED51C584EBB0749C4770290379FB7EF"},
-    ],
-    "ID": [
-        {"uid": "7642857250", "password": "HAMZA-_8CO7"},
-        {"uid": "7642857264", "password": "HAMZA-_42D2"},
-    ],
-    "SAC": [
-        {"uid": "7642825639", "password": "HAMZA-_X4TE"},
-        {"uid": "7642825643", "password": "HAMZA-_3NUX"},
-    ],
-    "NA": [
-        {"uid": "7642807933", "password": "HAMZA-_ODSJ"},
-        {"uid": "7642807944", "password": "HAMZA-_R3IJ"},
-    ],
-    "BR": [
-        {"uid": "7642795484", "password": "HAMZA-_SLGG"},
-        {"uid": "7642795487", "password": "HAMZA-_2PLV"},
-    ],
-    "PK": [
-        {"uid": "7642765148", "password": "HAMZA-_3NKO"},
-        {"uid": "7642765146", "password": "HAMZA-_WVRX"},
-    ],
-    "BD": [
-        {"uid": "7642744055", "password": "HAMZA-_PQ9A"},
-        {"uid": "7642744040", "password": "HAMZA-_FDW7"},
-    ],
-}
+# ------------------ HTTP Session with Retries ------------------
+def create_http_session():
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    session.timeout = (5, 10)  # connect timeout, read timeout
+    return session
 
-# ==================== AES ====================
-AES_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
-AES_IV  = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+http_session = create_http_session()
 
-# ==================== Region → Host ====================
-REGION_HOSTS = {
-    "IND": "https://client.ind.freefiremobile.com",
-    "ID":  "https://clientbp.ggpolarbear.com",
-    "SAC": "https://client.us.freefiremobile.com",
-    "NA":  "https://client.us.freefiremobile.com",
-    "BR":  "https://client.us.freefiremobile.com",
-    "PK":  "https://clientbp.ggpolarbear.com",
-    "BD":  "https://clientbp.ggblueshark.com",
-    "US":  "https://client.us.freefiremobile.com",
-    "SG":  "https://clientbp.ggpolarbear.com",
-    "TH":  "https://clientbp.ggpolarbear.com",
-    "VN":  "https://clientbp.ggpolarbear.com",
-    "ME":  "https://clientbp.ggpolarbear.com",
-    "MY":  "https://clientbp.ggpolarbear.com",
-    "PH":  "https://clientbp.ggpolarbear.com",
-    "RU":  "https://clientbp.ggpolarbear.com",
-}
-DEFAULT_HOST = "https://client.ind.freefiremobile.com"
-
-# ==================== Session ====================
-SESSION = requests.Session()
-SESSION.verify = False
-_adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=0)
-SESSION.mount("http://", _adapter)
-SESSION.mount("https://", _adapter)
-TIMEOUT = 5
-WORKERS = 20
-
-# ==================== Caches ====================
-_TOKENS = None
-_TOKENS_LOADED_AT = 0
-_TOKENS_LOCK = threading.Lock()
-_TOKENS_TTL = 300
-
-_RESPONSES = {}
-_RESPONSES_LOCK = threading.Lock()
-_RESPONSE_TTL = 1800
-
-_METRICS = {"total": 0, "success": 0, "fail": 0, "cache_hit": 0, "time": 0.0}
-
-# ==================== Static Maps ====================
-BR_RANKS = [(0,"Bronze I"),(100,"Bronze II"),(200,"Bronze III"),
-    (300,"Silver I"),(400,"Silver II"),(500,"Silver III"),
-    (600,"Gold I"),(700,"Gold II"),(800,"Gold III"),
-    (900,"Platinum I"),(1000,"Platinum II"),(1100,"Platinum III"),
-    (1200,"Diamond I"),(1300,"Diamond II"),(1400,"Diamond III"),
-    (1500,"Diamond IV"),(1700,"Heroic"),(2000,"Elite Heroic"),
-    (2300,"Master"),(2600,"Elite Master"),(2900,"Grandmaster")]
-
-PET_NAMES = {
-    1300000001:"Kitty", 1300000002:"Ottero", 1300000003:"Mr. Waggor",
-    1300000004:"Falco", 1300000005:"Robby", 1300000006:"Shiba",
-    1300000007:"Sensei Tig", 1300000008:"Agent Hop", 1300000009:"Beaston",
-}
-GENDER_MAP = {0: "None", 1: "Male", 2: "Female", 3: "Confidential"}
-LANGUAGE_MAP = {0: "None", 1: "English", 2: "Chinese (Simplified)", 3: "Chinese (Traditional)",
-                4: "Thai", 5: "Vietnamese", 6: "Indonesian", 7: "Portuguese",
-                8: "Spanish", 9: "Russian", 10: "Korean", 11: "French",
-                12: "German", 13: "Turkish", 14: "Hindi", 15: "Japanese"}
-MODE_PREFER_MAP = {0: "None", 1: "BR", 2: "CS", 3: "Entertainment"}
-RANK_SHOW_MAP = {0: "None", 1: "BR", 2: "CS"}
-VETERAN_MAP = {0: "None", 1: "Short", 2: "Normal", 3: "Long", 4: "Very Long"}
-TIME_ONLINE_MAP = {0: "None", 1: "Workday", 2: "Weekend"}
-TIME_ACTIVE_MAP = {0: "None", 1: "Morning", 2: "Afternoon", 3: "Night"}
-
-
-def log(tag, msg):
-    print(f"[{time.strftime('%H:%M:%S')}] [{tag}] {msg}", flush=True)
-
-
-# ==================== Crypto ====================
-def enc(d):
-    return AES.new(AES_KEY, AES.MODE_CBC, AES_IV).encrypt(pad(d, AES.block_size))
-
-
-def dec(d):
-    return unpad(AES.new(AES_KEY, AES.MODE_CBC, AES_IV).decrypt(d), AES.block_size)
-
-
-# ==================== Protobuf ====================
-def vi(n):
-    o = []
-    while True:
-        b = n & 0x7F; n >>= 7
-        if n: b |= 0x80
-        o.append(b)
-        if not n: break
-    return bytes(o)
-
-
-def fi(f, n):
-    return vi((f << 3) | 0) + vi(int(n))
-
-
-def rv(d, o):
-    r = 0; s = 0
-    while True:
-        b = d[o]; r |= (b & 0x7F) << s; o += 1
-        if not (b & 0x80): break
-        s += 7
-    return r, o
-
-
-def pp(d, depth=0):
-    if depth > 8: return None
-    r = {}; o = 0
-    while o < len(d):
-        try: t, o = rv(d, o)
-        except IndexError: break
-        f = t >> 3; w = t & 7
-        if w == 0:
-            v, o = rv(d, o); r[f] = v
-        elif w == 2:
-            ln, o = rv(d, o)
-            if o + ln > len(d): break
-            v = d[o:o+ln]; o += ln
+# ------------------ Protobuf to Dict ------------------
+def proto_to_dict(message):
+    """
+    Safely converts protobuf to dict without relying on buggy 'label' attributes.
+    """
+    result = {}
+    
+    for field in getattr(message.DESCRIPTOR, 'fields', []):
+        value = getattr(message, field.name)
+        val_type = type(value).__name__
+        
+        if 'MapContainer' in val_type:
+            map_result = {}
+            for k, v in value.items():
+                if hasattr(v, 'DESCRIPTOR'):
+                    map_result[k] = proto_to_dict(v)
+                elif isinstance(v, bytes):
+                    map_result[k] = binascii.hexlify(v).decode('utf-8')
+                else:
+                    map_result[k] = v
+            result[field.name] = map_result
+            
+        elif 'Repeated' in val_type:
+            list_result = []
+            for item in value:
+                if hasattr(item, 'DESCRIPTOR'):
+                    list_result.append(proto_to_dict(item))
+                elif isinstance(item, bytes):
+                    list_result.append(binascii.hexlify(item).decode('utf-8'))
+                else:
+                    list_result.append(item)
+            result[field.name] = list_result
+            
+        elif hasattr(value, 'DESCRIPTOR'):
+            result[field.name] = proto_to_dict(value)
+            
+        elif getattr(field, 'type', None) == 14: # 14 is FieldDescriptor.TYPE_ENUM
             try:
-                x = v.decode('utf-8')
-                if all(32 <= ord(c) < 127 or ord(c) > 127 for c in x):
-                    r[f] = x; continue
-            except: pass
-            try:
-                n = pp(v, depth + 1)
-                r[f] = n if n else v.hex()
-            except: r[f] = v.hex()
-        elif w == 5:
-            r[f] = int.from_bytes(d[o:o+4], 'little'); o += 4
-        elif w == 1:
-            r[f] = int.from_bytes(d[o:o+8], 'little'); o += 8
-        else: break
-    return r
+                result[field.name] = field.enum_type.values_by_number[value].name
+            except:
+                result[field.name] = value
+                
+        elif isinstance(value, bytes):
+            result[field.name] = binascii.hexlify(value).decode('utf-8') if value else ""
+            
+        else:
+            result[field.name] = value
+
+    return result
 
 
-def parse_resp(raw):
-    try: return json.loads(raw)
-    except: pass
-    try: return pp(dec(raw))
-    except: pass
-    try: return pp(raw)
-    except: return {}
-
-
-# ==================== JWT ====================
-def decode_jwt(j):
-    try:
-        s = j.split('.')[1]; s += '=' * (-len(s) % 4)
-        return json.loads(base64.urlsafe_b64decode(s))
-    except: return {}
-
-
-def jwt_exp(j):
-    return int(decode_jwt(j).get('exp') or 0)
-
-
-def jwt_region(j):
-    p = decode_jwt(j)
-    return (p.get('noti_region') or p.get('country_code')
-            or p.get('lock_region') or 'IND').upper()
-
-
-# ==================== Token Loader ====================
-def find_token_file():
-    paths = [
-        os.environ.get("TOKEN_FILE", ""),
-        "token.json",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "token.json"),
-        os.path.join(os.getcwd(), "token.json"),
-        "/var/task/token.json",
-        "/tmp/token.json",
-    ]
-    for p in paths:
-        if p and os.path.exists(p):
-            return p
+def extract_token_from_response(data, region):
+    """Safely extract JWT token from API response."""
+    if not isinstance(data, dict):
+        return None
+    
+    # Try common token keys
+    token = data.get("jwt_token") or data.get("token") or data.get("access_token")
+    if token:
+        return token
+    
+    # Sometimes nested in 'data'
+    if "data" in data and isinstance(data["data"], dict):
+        token = data["data"].get("token") or data["data"].get("jwt_token")
+        if token:
+            return token
+    
+    # Legacy region-specific checks (kept for compatibility)
+    if data.get("success") is True and "token" in data:
+        return data["token"]
+    
+    if region == "IND":
+        if data.get('status') in ['success', 'live']:
+            return data.get('token')
+    elif region in ["BR", "US", "SAC", "BD", "PK", "VN", "ME", "TH"]:
+        if 'token' in data:
+            return data['token']
+    else:
+        if data.get('status') == 'success':
+            return data.get('token')
+    
     return None
 
+def ensure_jwt_token_sync(region):
+    """Ensure JWT token is available; fetch/refresh automatically if missing or expired."""
+    global jwt_tokens, jwt_expiry
+    current_time = time.time()
 
-def load_tokens_from_file():
-    path = find_token_file()
-    if not path:
-        return {}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except Exception:
-        return {}
+    # Normalize region: 'DEFAULT' -> use 'default' key
+    if region.upper() == "DEFAULT":
+        region = "default"
 
-    entries = data if isinstance(data, list) else [data]
-    now = int(time.time())
-    tokens = {}
+    # If token exists and is valid, return it
+    if region in jwt_tokens and current_time < jwt_expiry.get(region, 0):
+        return jwt_tokens[region]
 
-    for e in entries:
-        if not isinstance(e, dict): continue
-        tok = e.get("token")
-        if not tok: continue
-        exp = jwt_exp(tok) or int(e.get("expires_at") or 0)
-        if not exp or now >= (exp - 300): continue
-        region = (e.get("region") or jwt_region(tok)).upper()
-        tokens[region] = {
-            "uid": e.get("uid"), "token": tok, "region": region,
-            "exp": exp, "remaining_min": (exp - now) // 60,
+    with jwt_lock:
+        # double-check after acquiring lock
+        if region in jwt_tokens and current_time < jwt_expiry.get(region, 0):
+            return jwt_tokens[region]
+
+        logger.info(f"[JWT] Token missing or expired for {region}. Fetching...")
+
+        endpoints = {
+            "IND": "https://jwt-phi-ten.vercel.app/token?uid=6994493475&password=1_JAHID_X_EMPIRE_9r0A2xxT",
+            "BR": "https://jwt-phi-ten.vercel.app/token?uid=4345418798&password=JOBAYAR_GK6VJ",
+            "US": "https://jwt-phi-ten.vercel.app/token?uid=3787481313&password=JlOivPeosauV0l9SG6gwK39lH3x2kJkO",
+            "SAC": "https://jwt-phi-ten.vercel.app/token?uid=6994520397&password=1_JAHID_X_EMPIRE_quRc2lOr",
+            "BD": "https://jwt-phi-ten.vercel.app/token?uid=6994726488&password=1_JAHID_X_EMPIRE_yLAicWRP",
+            "ID": "https://jwt-phi-ten.vercel.app/token?uid=6994726488&password=1_JAHID_X_EMPIRE_yLAicWRP",
+            "PK": "https://jwt-phi-ten.vercel.app/token?uid=6994726488&password=1_JAHID_X_EMPIRE_yLAicWRP",
+            "VN": "https://jwt-phi-ten.vercel.app/token?uid=6994726488&password=1_JAHID_X_EMPIRE_yLAicWRP",
+            "ME": "https://jwt-phi-ten.vercel.app/token?uid=6994726488&password=1_JAHID_X_EMPIRE_yLAicWRP",
+            "TH": "https://jwt-phi-ten.vercel.app/token?uid=6994726488&password=1_JAHID_X_EMPIRE_yLAicWRP",
+            "default": "https://jwt-phi-ten.vercel.app/token?uid=6994726488&password=1_JAHID_X_EMPIRE_yLAicWRP"
         }
-    log("TOKEN", f"loaded {len(tokens)} tokens from {path}")
-    return tokens
+
+        url = endpoints.get(region, endpoints["default"])
+
+        try:
+            response = http_session.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            token = extract_token_from_response(data, region)
+            if token:
+                jwt_tokens[region] = token
+                jwt_expiry[region] = current_time + 600  # 10 minutes
+                logger.info(f"[JWT] Token for {region} updated.")
+                return token
+            else:
+                logger.error(f"[JWT] Failed to extract token for {region}. Response: {data}")
+
+        except Exception as e:
+            logger.error(f"[JWT] Request error for {region}: {e}")
+
+    return jwt_tokens.get(region)
 
 
-def fetch_jwt(uid, password):
-    try:
-        r = SESSION.get(JWT_API.format(uid=uid, password=password), timeout=TIMEOUT)
-        if r.status_code != 200: return None
-        data = r.json()
-        for k in ("jwt", "token", "jwt_token", "access_token"):
-            v = data.get(k)
-            if isinstance(v, str) and v.startswith("eyJ"): return v
-        return None
-    except: return None
-
-
-def fetch_all_fallback():
-    def fetch_region(region, accounts):
-        for acc in accounts:
-            tok = fetch_jwt(acc["uid"], acc["password"])
-            if tok:
-                exp = jwt_exp(tok)
-                return region, {
-                    "uid": acc["uid"], "token": tok, "region": region,
-                    "exp": exp, "remaining_min": (exp - int(time.time())) // 60,
-                }
-        return region, None
-
-    results = {}
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futs = {pool.submit(fetch_region, r, JWT_ACCOUNTS[r]): r for r in JWT_ACCOUNTS}
-        for f in as_completed(futs):
-            region, entry = f.result()
-            if entry:
-                results[region] = entry
-    return results
-
-
-def get_tokens():
-    global _TOKENS, _TOKENS_LOADED_AT
-    now = time.time()
-    with _TOKENS_LOCK:
-        if _TOKENS and (now - _TOKENS_LOADED_AT) < _TOKENS_TTL:
-            return _TOKENS
-
-    tokens = load_tokens_from_file()
-    if not tokens:
-        tokens = fetch_all_fallback()
-
-    with _TOKENS_LOCK:
-        _TOKENS = tokens
-        _TOKENS_LOADED_AT = now
-    return tokens
-
-
-def invalidate_token(region):
-    global _TOKENS
-    with _TOKENS_LOCK:
-        if _TOKENS:
-            _TOKENS.pop(region, None)
-
-
-# ==================== Fetch Player ====================
-def build_body(aid):
-    return enc(fi(1, aid) + fi(2, 1))
-
-
-def try_token(token, aid, region):
-    host = REGION_HOSTS.get(region, DEFAULT_HOST)
-    body = build_body(aid)
-    h = {
-        "Authorization": f"Bearer {token}",
-        "X-GA": "v1 1",
-        "ReleaseVersion": "OB54",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-        "X-Unity-Version": "2022.3.47f1",
-        "Accept": "*/*",
-        "Accept-Encoding": "deflate, gzip",
+def get_api_endpoint(region):
+    endpoints = {
+        "IND": "https://client.ind.freefiremobile.com/GetPlayerPersonalShow",
+        "BR": "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
+        "US": "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
+        "SAC": "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
+        "BD": "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+        "ID": "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+        "PK": "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+        "VN": "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+        "ME": "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+        "TH": "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
+        "default": "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
     }
-    try:
-        r = SESSION.post(f"{host}/GetPlayerPersonalShow",
-                         headers=h, data=body, timeout=TIMEOUT)
-        if r.status_code == 200:
-            return parse_resp(r.content)
-        if r.status_code == 401:
-            invalidate_token(region)
-        return None
-    except: return None
+    return endpoints.get(region, endpoints["default"])
 
+default_key = "Yg&tc%DEuh6%Zc^8"
+default_iv = "6oyZDr22E3ychjM%"
 
-# ==================== Rank Helpers ====================
-def br_rank_name(p):
-    n = "Bronze I"
-    for t, x in BR_RANKS:
-        if p >= t: n = x
-        else: break
-    return n
+def encrypt_aes(hex_data, key, iv):
+    key = key.encode()[:16]
+    iv = iv.encode()[:16]
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    padded_data = pad(bytes.fromhex(hex_data), AES.block_size)
+    encrypted_data = cipher.encrypt(padded_data)
+    return binascii.hexlify(encrypted_data).decode()
 
-
-def cs_rank_name(p):
-    for t, n in [(2900,"Grandmaster"),(2600,"Elite Master"),(2300,"Master"),
-                 (2000,"Elite Heroic"),(1700,"Heroic"),(1500,"Diamond IV"),
-                 (1400,"Diamond III"),(1300,"Diamond II"),(1200,"Diamond I"),
-                 (1100,"Platinum III"),(1000,"Platinum II"),(900,"Platinum I"),
-                 (800,"Gold III"),(700,"Gold II"),(600,"Gold I")]:
-        if p >= t: return n
-    return "Bronze"
-
-
-def pet_name(pid):
-    return PET_NAMES.get(pid, f"Pet {pid}")
-
-
-def decode_hex(h):
-    if not isinstance(h, str) or not h: return ""
-    try: return bytes.fromhex(h).decode('utf-8', 'ignore').strip()
-    except: return ""
-
-
-def fmt_ts(ts):
-    if not ts or not isinstance(ts, int): return "N/A"
-    try:
-        return time.strftime("%d %B %Y at %I:%M:%S %p (IST)",
-                             time.gmtime(ts + 5*3600 + 30*60))
-    except: return str(ts)
-
-
-def humanize_ago(ts):
-    if not ts or not isinstance(ts, int): return "N/A"
-    try:
-        diff = int(time.time()) - ts
-        if diff < 0: return "in the future"
-        if diff < 60: return "just now"
-        days = diff // 86400
-        hrs = (diff % 86400) // 3600
-        mins = (diff % 3600) // 60
-        parts = []
-        if days: parts.append(f"{days} days")
-        if hrs: parts.append(f"{hrs} hr")
-        if mins and not days: parts.append(f"{mins} min")
-        return (" ".join(parts) + " ago") if parts else "just now"
-    except: return "N/A"
-
-
-def g(d, k, default=None):
-    if not isinstance(d, dict): return default
-    v = d.get(str(k), d.get(k, default))
-    if isinstance(v, dict) and 'data' in v: return v['data']
-    return v if v is not None else default
-
-
-# ==================== FULL RESPONSE BUILDER ====================
-def build_full_report(resp):
-    p = g(resp, 1) or {}
-
-    # ----- BASIC -----
-    uid = g(p, 1)
-    nickname = g(p, 3, "Unknown")
-    external_id = g(p, 4)
-    region = g(p, 5, "?")
-    level = g(p, 6, 0)
-    exp = g(p, 7, 0)
-    prime_level = g(p, 14, 0)
-    likes = g(p, 21, 0)
-    created = g(p, 24, 0)
-    last_login = g(p, 44, 0)
-    season = g(p, 50, "?")
-    bio_hex = g(g(g(p, 9, {}), 9, {}), 12, "")
-    bio = decode_hex(bio_hex) or "(empty)"
-
-    # ----- RANKS -----
-    br_points = g(p, 15, 0)
-    cs_blk = g(g(p, 61, {}), 3, {})
-    cs_pts = cs_blk.get('3', 0) if isinstance(cs_blk, dict) else 0
-    cs_stars = cs_blk.get('4', 0) if isinstance(cs_blk, dict) else 0
-    rank_blk = g(p, 49, {})
-    show_br = g(rank_blk, 2, 0) if isinstance(rank_blk, dict) else 0
-    show_cs = g(rank_blk, 3, 0) if isinstance(rank_blk, dict) else 0
-
-    # ----- SOCIAL -----
-    social = g(p, 9, {}) or {}
-    social_9 = g(social, 9, {}) or {}
-    gender_id = g(social_9, 2, 0)
-    language_id = g(social_9, 3, 0)
-    time_online_id = g(social_9, 4, 0)
-    time_active_id = g(social_9, 5, 0)
-    battle_tags = g(social_9, 6) or []
-    social_tags = g(social_9, 7) or []
-    mode_prefer_id = g(social_9, 8, 0)
-    rank_show_id = g(social_9, 10, 0)
-
-    # ----- CREDIT -----
-    credit_blk = g(resp, 11, {}) or {}
-    credit_score = g(credit_blk, 1, 0) if isinstance(credit_blk, dict) else 0
-    weekly_matches = g(credit_blk, 6, 0) if isinstance(credit_blk, dict) else 0
-
-    # ----- BOOYAH PASS -----
-    bp_t = g(g(p, 63, {}), 1, {})
-    if isinstance(bp_t, dict) and bp_t:
-        bp_event_id = bp_t.get('1') or bp_t.get(1)
-        bp_owned = bool(bp_t.get('2') or bp_t.get(2))
-        bp_badge = bp_t.get('3') or bp_t.get(3)
-        bp_badge_count = bp_t.get('4') or bp_t.get(4)
-        bp_max_level = bp_t.get('6') or bp_t.get(6)
-        bp_name = bp_t.get('7') or bp_t.get(7)
-    else:
-        bp_event_id = bp_badge = bp_badge_count = bp_max_level = None
-        bp_owned = False
-        bp_name = None
-    bp_label = "Premium" if bp_owned else "Free"
-
-    # ----- COSMETICS -----
-    banner_id = g(p, 11, 0)
-    badge_id = g(p, 19, 0)
-    pin_id = g(p, 33, 0)
-    weapon_skins = g(p, 32)
-    veteran_tag = g(p, 66, 0)
-    season_id = g(p, 20, 0)
-    bp_badges = g(p, 18, 0)
-
-    # ----- EQUIPPED (from field 2 = profile) -----
-    profile = g(resp, 2, {})
-    equipped = {
-        "avatar_id": None,
-        "clothes": {},
-        "equipped_skills": {},
-        "top": None, "bottom": None, "mask": None,
-        "facepaint": None, "shoes": None,
+def apis(idd, region):
+    token = ensure_jwt_token_sync(region)
+    if not token:
+        raise Exception(f"Failed to get JWT token for region {region}")
+    
+    endpoint = get_api_endpoint(region)
+    headers = {
+        'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)',
+        'Connection': 'Keep-Alive',
+        'Expect': '100-continue',
+        'Authorization': f'Bearer {token}',
+        'X-Unity-Version': '2018.4.11f1',
+        'X-GA': 'v1 1',
+        'ReleaseVersion': 'OB54',
+        'Content-Type': 'application/x-www-form-urlencoded',
     }
-    if isinstance(profile, dict):
-        equipped["avatar_id"] = profile.get('1') or profile.get(1)
-        equipped["clothes"] = profile.get('4') or profile.get(4)
-        equipped["equipped_skills"] = profile.get('5') or profile.get(5)
-        equipped["top"] = profile.get('14') or profile.get(14)
-        equipped["bottom"] = profile.get('15') or profile.get(15)
-        equipped["mask"] = profile.get('16') or profile.get(16)
-        equipped["facepaint"] = profile.get('17') or profile.get(17)
-        equipped["shoes"] = profile.get('18') or profile.get(18)
-
-    # ----- PET -----
-    pet_out = None
-    pet_blk = g(resp, 8, {})
-    if isinstance(pet_blk, dict) and pet_blk:
-        pid = pet_blk.get('1') or pet_blk.get(1)
-        pet_out = {
-            "id": pid,
-            "name": pet_name(pid),
-            "level": pet_blk.get('3') or pet_blk.get(3),
-            "exp": pet_blk.get('4') or pet_blk.get(4),
-        }
-
-    # ----- CLAN -----
-    clan_out = None
-    c = g(resp, 6, {})
-    L = g(resp, 7, {})
-    if isinstance(c, dict) and c:
-        clan_out = {
-            "id": c.get('1') or c.get(1),
-            "name": c.get('2') or c.get(2),
-            "level": c.get('4') or c.get(4),
-            "members_current": c.get('6') or c.get(6),
-            "members_max": c.get('5') or c.get(5),
-        }
-        if isinstance(L, dict) and L:
-            clan_out["leader"] = {
-                "name": L.get('3') or L.get(3),
-                "uid": L.get('1') or L.get(1),
-                "level": L.get('6') or L.get(6),
-            }
-
-    # ----- CRAFTLAND -----
-    craftland = None
+    
     try:
-        f41 = g(p, 41, {})
-        if isinstance(f41, dict):
-            f9 = f41.get('9') or f41.get(9)
-            if isinstance(f9, dict):
-                craftland = f9.get('25') or f9.get(25)
-    except: pass
+        data = bytes.fromhex(idd)
+        response = http_session.post(endpoint, headers=headers, data=data, timeout=10)
+        response.raise_for_status()
+        return response.content.hex()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[API] Request to {endpoint} failed: {e}")
+        raise
 
-    # ----- ACHIEVEMENTS -----
-    achievements = []
-    ach_blk = g(resp, 13) or g(p, 13)
-    if isinstance(ach_blk, list):
-        for a in ach_blk:
-            if isinstance(a, dict):
-                achievements.append({
-                    "id": a.get('1') or a.get(1),
-                    "level": a.get('2') or a.get(2),
-                })
-
-    # ===== FINAL ASSEMBLY (same as old) =====
-    return {
-        "achievements": achievements,
-        "basic": {
-            "created_ago": humanize_ago(last_login),       # swapped
-            "created_at": fmt_ts(last_login),               # swapped
-            "exp": exp,
-            "external_id": external_id,
-            "last_login": fmt_ts(created),                  # swapped
-            "last_login_ago": humanize_ago(created),        # swapped
-            "level": level,
-            "likes": likes,
-            "nickname": nickname,
-            "prime_level": prime_level,
-            "region": region,
-            "season": season,
-            "signature": bio,
-            "title": "Not Equipped",
-            "uid": uid,
-        },
-        "booyah_pass": {
-            "badge": bp_badge,
-            "badge_count": bp_badge_count,
-            "event_id": bp_event_id,
-            "event_name": bp_name,
-            "max_level": bp_max_level,
-            "owned": bp_owned,
-            "type": bp_label,
-        },
-        "clan": clan_out,
-        "cosmetics": {
-            "avatar_id": banner_id,
-            "badge_id": badge_id,
-            "banner_id": banner_id,
-            "bp_badges": bp_badges,
-            "pin_id": pin_id,
-            "season_id": season_id,
-            "veteran_tag": VETERAN_MAP.get(veteran_tag, "None"),
-            "weapon_skins": weapon_skins,
-        },
-        "craftland_map": craftland,
-        "credit": {
-            "credit_score": credit_score,
-            "weekly_matches": weekly_matches,
-        },
-        "equipped": equipped,
-        "pet": pet_out,
-        "ranks": {
-            "br_points": br_points,
-            "br_rank": br_rank_name(br_points),
-            "cs_points": cs_pts,
-            "cs_rank": cs_rank_name(cs_pts),
-            "cs_stars": cs_stars,
-            "show_br": bool(show_br),
-            "show_cs": bool(show_cs),
-            "show_rank": RANK_SHOW_MAP.get(rank_show_id, "None"),
-        },
-        "social": {
-            "battle_tags": battle_tags,
-            "gender": GENDER_MAP.get(gender_id, "None"),
-            "language": LANGUAGE_MAP.get(language_id, "None"),
-            "mode_prefer": MODE_PREFER_MAP.get(mode_prefer_id, "None"),
-            "social_tags": social_tags,
-            "time_active": TIME_ACTIVE_MAP.get(time_active_id, "None"),
-            "time_online": TIME_ONLINE_MAP.get(time_online_id, "None"),
-        },
-    }
-
-
-# ==================== Parallel Fetch ====================
-def fetch_parallel(target):
-    cache = get_tokens()
-    if not cache:
-        return None, None, None, "no tokens"
-
-    with ThreadPoolExecutor(max_workers=min(WORKERS, len(cache))) as pool:
-        futs = {
-            pool.submit(try_token, e["token"], target, r): (r, e["uid"])
-            for r, e in cache.items()
-        }
-        for f in as_completed(futs):
-            region, uid = futs[f]
-            try:
-                resp = f.result()
-                if resp:
-                    return build_full_report(resp), region, uid, None
-            except: continue
-
-    return None, None, None, "all failed"
-
-
-def get_cached_response(uid):
-    with _RESPONSES_LOCK:
-        e = _RESPONSES.get(uid)
-        if e and (time.time() - e["ts"]) < _RESPONSE_TTL:
-            return e
-    return None
-
-
-def set_cached_response(uid, data, region, used_uid):
-    with _RESPONSES_LOCK:
-        _RESPONSES[uid] = {
-            "data": data, "region": region,
-            "used_uid": used_uid, "ts": time.time(),
-        }
-        if len(_RESPONSES) > 1000:
-            oldest = sorted(_RESPONSES.items(), key=lambda x: x[1]["ts"])[:200]
-            for k, _ in oldest:
-                _RESPONSES.pop(k, None)
-
-
-# ==================== Hooks ====================
-@app.before_request
-def _start(): g.start = time.time()
-
-
-@app.after_request
-def _log(response):
-    elapsed = time.time() - g.start
-    _METRICS["total"] += 1
-    _METRICS["time"] += elapsed
-    if response.status_code == 200:
-        _METRICS["success"] += 1
-    else:
-        _METRICS["fail"] += 1
-    return response
-
-
-# ==================== ENDPOINTS ====================
-@app.route('/get', methods=['GET'])
-@app.route('/info', methods=['GET'])
-def get_info():
-    uid_in = (request.args.get('info')
-              or request.args.get('uid')
-              or request.args.get('follower')
-              or '').strip()
-
-    if not uid_in or not uid_in.isdigit():
-        return jsonify({
-            "success": False,
-            "error": "uid required",
-            "example": "/get?info=1901614992",
-            "credit": CREDIT,
-        }), 400
-
-    target = int(uid_in)
-    t0 = time.time()
-
-    cached = get_cached_response(target)
-    if cached:
-        _METRICS["cache_hit"] += 1
-        return jsonify({
-            "success": True,
-            "region": cached["region"],
-            "used_uid": cached["used_uid"],
-            "token_source": "response_cache",
-            "time_sec": round(time.time() - t0, 3),
-            "data": cached["data"],
-            "credit": CREDIT,
-        })
-
-    info, region, used_uid, err = fetch_parallel(target)
-    elapsed = round(time.time() - t0, 3)
-
-    if not info:
-        return jsonify({
-            "success": False,
-            "error": "player_fetch_failed",
-            "detail": err,
-            "time_sec": elapsed,
-            "credit": CREDIT,
-        }), 502
-
-    set_cached_response(target, info, region, used_uid)
-
-    return jsonify({
-        "success": True,
-        "region": region,
-        "used_uid": used_uid,
-        "token_source": "parallel",
-        "time_sec": elapsed,
-        "data": info,
-        "credit": CREDIT,
-    })
-
-
-@app.route('/tokens/reload', methods=['GET'])
-def reload_tokens():
-    global _TOKENS, _TOKENS_LOADED_AT
-    with _TOKENS_LOCK:
-        _TOKENS = None
-        _TOKENS_LOADED_AT = 0
-    cache = get_tokens()
-    return jsonify({
-        "success": True,
-        "reloaded": len(cache),
-        "tokens": [{"uid": e["uid"], "region": r, "expires_in_min": e["remaining_min"]}
-                   for r, e in cache.items()],
-        "credit": CREDIT,
-    })
-
-
-@app.route('/tokens/status', methods=['GET'])
-def token_status():
-    cache = get_tokens()
-    path = find_token_file()
-    return jsonify({
-        "success": True,
-        "token_file": path or "(not found)",
-        "cached_regions": len(cache),
-        "tokens": [{"uid": e["uid"], "region": r, "expires_in_min": e["remaining_min"]}
-                   for r, e in cache.items()],
-        "response_cache_size": len(_RESPONSES),
-        "credit": CREDIT,
-    })
-
-
-@app.route('/metrics', methods=['GET'])
-def metrics():
-    t = _METRICS["total"]
-    return jsonify({
-        "success": True,
-        "metrics": {
-            "total": t,
-            "success": _METRICS["success"],
-            "fail": _METRICS["fail"],
-            "cache_hits": _METRICS["cache_hit"],
-            "cache_hit_rate": f"{(_METRICS['cache_hit'] / t * 100):.1f}%" if t else "0%",
-            "avg_time_sec": round(_METRICS["time"] / t, 3) if t else 0,
-        },
-        "credit": CREDIT,
-    })
-
-
+# ------------------ Flask Routes ------------------
 @app.route('/', methods=['GET'])
 def home():
-    cache = get_tokens()
-    return jsonify({
-        "name": "Fast Player Info API",
-        "version": VERSION,
-        "token_file": find_token_file() or "(missing)",
-        "cached_tokens": len(cache),
-        "endpoints": {
-            "/get?info={uid}": "Full player info",
-            "/info?uid={uid}": "Alias",
-            "/tokens/reload": "Reload token.json",
-            "/tokens/status": "Token cache status",
-            "/metrics": "Server metrics",
-        },
-        "credit": CREDIT,
-    })
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>ARAFAT ACCOUNT INFO</title>
+        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+        <style>
+            :root {
+                --primary: #FF4655;
+                --accent: #00FF94;
+                --bg-dark: #0f172a;
+                --glass: rgba(255, 255, 255, 0.05);
+                --glass-border: rgba(255, 255, 255, 0.1);
+            }
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: 'Outfit', sans-serif;
+                background-color: var(--bg-dark);
+                background-image: 
+                    radial-gradient(at 0% 0%, hsla(253,16%,7%,1) 0, transparent 50%), 
+                    radial-gradient(at 50% 0%, hsla(225,39%,30%,1) 0, transparent 50%), 
+                    radial-gradient(at 100% 0%, hsla(339,49%,30%,1) 0, transparent 50%);
+                color: white;
+                height: 100vh;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+                overflow: hidden;
+            }
+            .bg-animation {
+                position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: -1;
+                background-size: 40px 40px;
+                background-image:
+                  linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+                  linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+            }
+            .container {
+                position: relative; background: var(--glass);
+                backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+                border: 1px solid var(--glass-border); padding: 3rem 2rem;
+                border-radius: 24px; text-align: center;
+                box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+                max-width: 600px; width: 90%; animation: float 6s ease-in-out infinite;
+            }
+            h1 {
+                font-size: 2.5rem; font-weight: 700; margin-bottom: 0.5rem;
+                background: linear-gradient(to right, #fff, #cbd5e1);
+                -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+                letter-spacing: -1px; text-shadow: 0 0 20px rgba(255, 255, 255, 0.1);
+            }
+            .badge {
+                display: inline-flex; align-items: center; gap: 8px;
+                background: rgba(0, 255, 148, 0.1); border: 1px solid rgba(0, 255, 148, 0.2);
+                color: var(--accent); padding: 8px 16px; border-radius: 100px;
+                font-size: 0.9rem; font-weight: 500; font-family: 'JetBrains Mono', monospace;
+                margin-bottom: 2rem; box-shadow: 0 0 15px rgba(0, 255, 148, 0.1);
+            }
+            .dot {
+                width: 8px; height: 8px; background-color: var(--accent);
+                border-radius: 50%; animation: pulse 2s infinite;
+            }
+            .code-box {
+                background: rgba(0, 0, 0, 0.3); border: 1px solid var(--glass-border);
+                border-radius: 12px; padding: 1.5rem; margin: 0 auto 1rem auto;
+                font-family: 'JetBrains Mono', monospace; font-size: 0.9rem;
+                color: #a5b4fc; word-break: break-all; cursor: pointer; transition: all 0.3s ease;
+            }
+            .code-box:last-of-type { margin-bottom: 2.5rem; }
+            .code-box:hover { border-color: rgba(255, 255, 255, 0.3); transform: translateY(-2px); }
+            .footer-links { display: flex; flex-direction: column; gap: 12px; margin-top: 1rem; }
+            .btn {
+                text-decoration: none; padding: 12px 20px; border-radius: 12px;
+                font-weight: 500; transition: all 0.3s ease; display: flex;
+                align-items: center; justify-content: center; gap: 10px;
+            }
+            .btn-credit { background: rgba(255, 255, 255, 0.03); border: 1px solid var(--glass-border); color: #e2e8f0; }
+            .btn-credit:hover { background: rgba(255, 255, 255, 0.1); border-color: #e2e8f0; }
+            .btn-power {
+                background: linear-gradient(45deg, #4f46e5, #06b6d4); color: white;
+                box-shadow: 0 10px 20px -10px rgba(79, 70, 229, 0.5);
+            }
+            .btn-power:hover { filter: brightness(1.1); transform: scale(1.02); box-shadow: 0 15px 30px -10px rgba(79, 70, 229, 0.6); }
+            @keyframes pulse {
+                0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(0, 255, 148, 0.7); }
+                70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(0, 255, 148, 0); }
+                100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(0, 255, 148, 0); }
+            }
+            @keyframes float {
+                0% { transform: translateY(0px); }
+                50% { transform: translateY(-10px); }
+                100% { transform: translateY(0px); }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="bg-animation"></div>
+        <div class="container">
+            <h1>Free Fire<br>PLAYER INFO API</h1>
+            <div class="badge"><div class="dot"></div>API IS RUNNING</div>
+            <div class="code-box" onclick="copyText('/info?uid={uid}')">/info?uid={uid}</div>
+            <div class="code-box" onclick="copyText('/wishlist?uid={uid}')">/wishlist?uid={uid}</div>
+            <div class="footer-links">
+                <a href="https://t.me/Jahid_x_Empire" target="_blank" class="btn btn-credit">
+                    <i class="fab fa-telegram"></i><span>Credit: @arafat_flex</span>
+                </a>
+                <a href="https://t.me/arafat_source" target="_blank" class="btn btn-power">
+                    <i class="fas fa-bolt"></i><span>TELEGRAM CHHANAL: @arafat_flex</span>
+                </a>
+            </div>
+        </div>
+        <script>function copyText(text) { navigator.clipboard.writeText(text); }</script>
+    </body>
+    </html>
+    """
+    return html_content
 
 
-# ==================== Startup ====================
-print(f"\n⚡ Fast Player Info API v{VERSION}")
-print(f"   Token file: {find_token_file() or '(not found)'}")
-try:
-    initial = get_tokens()
-    print(f"   ✅ Loaded {len(initial)} tokens\n")
-except Exception as e:
-    print(f"   ⚠️  Init: {e}\n")
+@app.route('/info', methods=['GET'])
+def get_player_info():
+    try:
+        uid = request.args.get('uid')
+        region = request.args.get('region', 'BD').upper()
+        custom_key = request.args.get('key', default_key)
+        custom_iv = request.args.get('iv', default_iv)
+        
+        if not uid:
+            return jsonify({"error": "UID parameter is required"}), 400
+        
+        message = uid_generator_pb2.uid_generator()
+        message.saturn_ = int(uid)
+        message.garena = 1
+        protobuf_data = message.SerializeToString()
+        hex_data = binascii.hexlify(protobuf_data).decode()
+        
+        encrypted_hex = encrypt_aes(hex_data, custom_key, custom_iv)
+        
+        api_response = apis(encrypted_hex, region)
+        if not api_response:
+            return jsonify({"error": "Empty response from API"}), 400
+        
+        message = AccountPersonalShowInfo()
+        message.ParseFromString(bytes.fromhex(api_response))
+        
+        result = proto_to_dict(message)
+        return jsonify(result)
+    
+    except ValueError:
+        return jsonify({"error": "Invalid UID format"}), 400
+    except Exception as e:
+        logger.error(f"[ERROR] Processing request: {e}")
+        return jsonify({"error": f"Failure to process the data: {str(e)}"}), 500
 
+@app.route('/wishlist', methods=['GET'])
+def get_wishlist_info():
+    try:
+        uid = request.args.get('uid')
+        region = request.args.get('region', 'BD').upper()
+        custom_key = request.args.get('key', default_key)
+        custom_iv = request.args.get('iv', default_iv)
+        
+        if not uid:
+            return jsonify({"error": "UID parameter is required"}), 400
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+        req = GetWishListItems_pb2.CSGetWishListItemsReq()
+        req.account_id = int(uid)
+        
+        protobuf_data = req.SerializeToString()
+        hex_data = binascii.hexlify(protobuf_data).decode()
+        encrypted_hex = encrypt_aes(hex_data, custom_key, custom_iv)
+        
+        base_endpoint = get_api_endpoint(region)
+        wishlist_url = base_endpoint.replace("GetPlayerPersonalShow", "GetWishListItems")
+        
+        token = ensure_jwt_token_sync(region)
+        headers = {
+            'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)',
+            'Connection': 'Keep-Alive',
+            'Authorization': f'Bearer {token}',
+            'X-Unity-Version': '2018.4.11f1',
+            'X-GA': 'v1 1',
+            'ReleaseVersion': 'OB54',
+            'Content-Type': 'application/x-www-form-urlencoded',
+        }
+
+        response = http_session.post(wishlist_url, headers=headers, data=bytes.fromhex(encrypted_hex), timeout=10)
+        response.raise_for_status()
+        resp_hex = response.content.hex()
+        
+        res = GetWishListItems_pb2.CSGetWishListItemsRes()
+        res.ParseFromString(bytes.fromhex(resp_hex))
+        
+        result = proto_to_dict(res)
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"[ERROR] Wishlist request: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/favicon.ico')
+def favicon():
+    return '', 404
+
+# ------------------ Main ------------------
+if __name__ == "__main__":
+    # For production, use Gunicorn with multiple workers:
+    # gunicorn -w 4 -b 0.0.0.0:1080 app:app
+    app.run(host="0.0.0.0", port=1080, threaded=True)
