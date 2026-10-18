@@ -1,12 +1,14 @@
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 import binascii
+import json
 import requests
 from flask import Flask, jsonify, request
 import threading
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -19,6 +21,45 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# ------------------ File Loading ------------------
+BASE_DIR = Path(__file__).parent
+
+def _load_json(name, default):
+    path = BASE_DIR / name
+    if not path.exists():
+        logger.warning(f"[FILE] {name} not found — using empty {type(default).__name__}")
+        return default
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"[FILE] Failed to load {name}: {e}")
+        return default
+
+# token.json → list of {token, region, uid, expires_at}
+RAW_TOKENS = _load_json("token.json", [])
+
+# accounts.json → {region: [{uid, password}, ...]}
+RAW_ACCOUNTS = _load_json("accounts.json", {})
+
+# Index tokens by region
+REGION_TOKENS = {}
+for t in RAW_TOKENS:
+    r = (t.get("region") or t.get("expected_region") or "").upper()
+    if r and t.get("token"):
+        REGION_TOKENS.setdefault(r, []).append(t)
+
+# Normalize accounts keys to upper
+ACCOUNTS = {k.upper(): v for k, v in RAW_ACCOUNTS.items()}
+
+# Regions to query = anything we have a token OR credentials for
+QUERY_REGIONS = sorted(set(REGION_TOKENS.keys()) | set(ACCOUNTS.keys()))
+
+logger.info(f"[BOOT] Loaded {sum(len(v) for v in REGION_TOKENS.values())} tokens across {list(REGION_TOKENS.keys())}")
+logger.info(f"[BOOT] Loaded accounts for {list(ACCOUNTS.keys())}")
+logger.info(f"[BOOT] Query regions: {QUERY_REGIONS}")
+
 
 # ------------------ HTTP Session ------------------
 def create_http_session():
@@ -33,35 +74,80 @@ def create_http_session():
 
 http_session = create_http_session()
 
-# ============================================================
-# TOKEN API
-# ============================================================
+
+# ------------------ Token Refresh API ------------------
 TOKEN_API_BASE = "https://ff-jwt-gen-api.lovable.app/api/public/token"
+JWT_TTL = 600  # 10 min cache for freshly fetched tokens
+
+jwt_cache  = {}
+jwt_expiry = {}
+jwt_lock   = threading.Lock()
 
 
-def fetch_token(uid, password):
+def _fetch_token_live(uid, password):
     try:
         r = http_session.get(TOKEN_API_BASE,
                              params={"uid": uid, "password": password},
                              timeout=10)
         if r.status_code != 200:
-            logger.warning(f"[TOKEN] HTTP {r.status_code} for {uid}")
             return None
-        data = r.json()
-        if data.get("success") and data.get("token"):
-            return data["token"]
-        logger.warning(f"[TOKEN] Bad response for {uid}: {data}")
-        return None
+        d = r.json()
+        if d.get("success") and d.get("token"):
+            return d["token"]
     except Exception as e:
-        logger.warning(f"[TOKEN] Request failed for {uid}: {e}")
+        logger.warning(f"[TOKEN-FETCH] {uid}: {e}")
+    return None
+
+
+def get_token_for_region(region):
+    """
+    Priority order:
+      1. In-memory cache (freshly fetched, valid)
+      2. token.json entry that hasn't expired
+      3. Fresh fetch from lovable.app using accounts.json credentials
+      4. None
+    """
+    now = time.time()
+
+    if region in jwt_cache and now < jwt_expiry.get(region, 0):
+        return jwt_cache[region]
+
+    with jwt_lock:
+        if region in jwt_cache and now < jwt_expiry.get(region, 0):
+            return jwt_cache[region]
+
+        # --- 1) Pick best valid token from token.json ---
+        best_tok = None
+        best_exp = 0
+        for entry in REGION_TOKENS.get(region, []):
+            exp = entry.get("expires_at", 0)
+            if exp > now and exp > best_exp:
+                best_tok = entry["token"]
+                best_exp = exp
+
+        if best_tok:
+            jwt_cache[region] = best_tok
+            jwt_expiry[region] = best_exp
+            logger.info(f"[TOKEN] {region} ← token.json (valid {int(best_exp-now)}s)")
+            return best_tok
+
+        # --- 2) Fetch fresh from lovable.app using accounts.json ---
+        for cred in ACCOUNTS.get(region, []):
+            tok = _fetch_token_live(cred["uid"], cred["password"])
+            if tok:
+                jwt_cache[region] = tok
+                jwt_expiry[region] = now + JWT_TTL
+                logger.info(f"[TOKEN] {region} ← fresh fetch (uid={cred['uid']})")
+                return tok
+
+        logger.error(f"[TOKEN] No valid token for {region} "
+                     f"(tokens={len(REGION_TOKENS.get(region,[]))}, "
+                     f"accounts={len(ACCOUNTS.get(region,[]))})")
         return None
 
 
-# ============================================================
-# REGION URLS  (your mapping + ggpolarbear extensions)
-# ============================================================
+# ------------------ Endpoint Mapping ------------------
 REGION_URLS = {
-    # ---- Your mapping (unchanged) ----
     "IND": "https://client.ind.freefiremobile.com/UpdateSocialBasicInfo",
     "IN":  "https://client.ind.freefiremobile.com/UpdateSocialBasicInfo",
     "US":  "https://client.us.freefiremobile.com/UpdateSocialBasicInfo",
@@ -70,8 +156,6 @@ REGION_URLS = {
     "SAC": "https://client.us.freefiremobile.com/UpdateSocialBasicInfo",
     "SG":  "https://clientbp.ggblueshark.com/UpdateSocialBasicInfo",
     "BP":  "https://clientbp.ggblueshark.com/UpdateSocialBasicInfo",
-
-    # ---- Added for accounts we already have (ggpolarbear cluster) ----
     "BD":  "https://clientbp.ggpolarbear.com/UpdateSocialBasicInfo",
     "ID":  "https://clientbp.ggpolarbear.com/UpdateSocialBasicInfo",
     "PK":  "https://clientbp.ggpolarbear.com/UpdateSocialBasicInfo",
@@ -84,79 +168,11 @@ REGION_URLS = {
 
 
 def build_endpoint(region, method="GetPlayerPersonalShow"):
-    """Take region's REGION_URLS entry and swap method name."""
-    base = REGION_URLS.get(region)
-    if not base:
-        base = "https://clientbp.ggpolarbear.com/UpdateSocialBasicInfo"
+    base = REGION_URLS.get(region, "https://clientbp.ggpolarbear.com/UpdateSocialBasicInfo")
     return base.replace("UpdateSocialBasicInfo", method)
 
 
-# ============================================================
-# REGION ACCOUNTS  (we query only regions we have creds for)
-# ============================================================
-REGION_ACCOUNTS = {
-    "BD":  {"uid": "8063692016",
-            "password": "0D15656349D81510A007CCA7C63AD6D3D7D34D816012686DB9042A266A96A457"},
-    "IND": {"uid": "4520536411",
-            "password": "B31452B326F2A4C919BEDF5D119AC884043BAAE8BFE168A6CB7C6B4CE7C6A0FD"},
-    "ME":  {"uid": "8304690996",
-            "password": "6CC453C9E0D37D33DC16861DCACC675C8726D017950E11B693A656770D7F88C8"},
-    "ID":  {"uid": "8304693210",
-            "password": "B125B2DDEF5B9C827C014DA5F4BA548E6281EEFDBA8B51708818CD00CDAC52C8"},
-    "VN":  {"uid": "8304696053",
-            "password": "12C4AD1C68022FD05227743AA5B0FA69797E68244FCC7DD6DF213909867B3BA1"},
-    "TH":  {"uid": "8304697462",
-            "password": "987282103FA98575AAE2218D7D2DCB1CA0452EE1DD2A39EE4B2440C89A9AE216"},
-    "PK":  {"uid": "8304710694",
-            "password": "7D1232078446A16BB168B02ECD2BF0E30B472547C84A1719BAF5D9B49E3BDF60"},
-    "TW":  {"uid": "8304716792",
-            "password": "B66C4C83F8D07C040142577312428BF4510E6D7659026125E858D9914998B21C"},
-    "CIS": {"uid": "8304718687",
-            "password": "C7D64DD09683C88FFD459B3D9B1FC351155EDE47C09D3B5111772AC75491DE35"},
-    "NA":  {"uid": "7642807933",
-            "password": "HAMZA-_ODSJ"},
-}
-
-QUERY_REGIONS = list(REGION_ACCOUNTS.keys())
-
-
-# ============================================================
-# JWT CACHE
-# ============================================================
-jwt_cache  = {}
-jwt_expiry = {}
-jwt_lock   = threading.Lock()
-JWT_TTL    = 600
-
-
-def get_jwt(region):
-    now = time.time()
-    if region in jwt_cache and now < jwt_expiry.get(region, 0):
-        return jwt_cache[region]
-
-    with jwt_lock:
-        if region in jwt_cache and now < jwt_expiry.get(region, 0):
-            return jwt_cache[region]
-
-        acct = REGION_ACCOUNTS.get(region)
-        if not acct:
-            logger.error(f"[JWT] No account for {region}")
-            return None
-
-        tok = fetch_token(acct["uid"], acct["password"])
-        if tok:
-            jwt_cache[region] = tok
-            jwt_expiry[region] = now + JWT_TTL
-            logger.info(f"[JWT] {region} cached (uid={acct['uid']})")
-            return tok
-
-        logger.error(f"[JWT] No token for {region}")
-        return None
-
-
-# ============================================================
-# PROTOBUF
-# ============================================================
+# ------------------ Protobuf + AES ------------------
 def proto_to_dict(message):
     result = {}
     for field in getattr(message.DESCRIPTOR, 'fields', []):
@@ -202,9 +218,9 @@ def encrypt_aes(hex_data, key, iv):
 
 
 def direct_ff_call(encrypted_hex, region, method="GetPlayerPersonalShow"):
-    token = get_jwt(region)
+    token = get_token_for_region(region)
     if not token:
-        raise Exception(f"No JWT for {region}")
+        raise Exception(f"No token for {region}")
 
     url = build_endpoint(region, method)
     headers = {
@@ -222,10 +238,8 @@ def direct_ff_call(encrypted_hex, region, method="GetPlayerPersonalShow"):
     return r.content
 
 
-# ============================================================
-# MULTI-REGION LOOKUP
-# ============================================================
-def _try_region_info(uid_encrypted, region):
+# ------------------ Multi-Region Lookup ------------------
+def _try_region(uid_encrypted, region):
     try:
         raw = direct_ff_call(uid_encrypted, region, "GetPlayerPersonalShow")
         msg = AccountPersonalShowInfo()
@@ -234,7 +248,7 @@ def _try_region_info(uid_encrypted, region):
         if basic.get("account_id"):
             return basic
     except Exception as e:
-        logger.debug(f"[INFO] {region} failed: {e}")
+        logger.debug(f"[INFO] {region}: {e}")
     return None
 
 
@@ -245,8 +259,8 @@ def lookup_all_regions(uid):
     enc = encrypt_aes(binascii.hexlify(m.SerializeToString()).decode(),
                       default_key, default_iv)
 
-    with ThreadPoolExecutor(max_workers=len(QUERY_REGIONS)) as executor:
-        futures = {executor.submit(_try_region_info, enc, r): r for r in QUERY_REGIONS}
+    with ThreadPoolExecutor(max_workers=len(QUERY_REGIONS) or 1) as executor:
+        futures = {executor.submit(_try_region, enc, r): r for r in QUERY_REGIONS}
         for fut in as_completed(futures):
             try:
                 basic = fut.result()
@@ -259,16 +273,14 @@ def lookup_all_regions(uid):
     return None
 
 
-# ============================================================
-# FLASK ROUTES
-# ============================================================
+# ------------------ Flask Routes ------------------
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
         "status": "running",
-        "token_api": TOKEN_API_BASE,
         "query_regions": QUERY_REGIONS,
-        "region_endpoints": {r: REGION_URLS[r] for r in REGION_URLS},
+        "tokens_loaded": {r: len(v) for r, v in REGION_TOKENS.items()},
+        "accounts_loaded": {r: len(v) for r, v in ACCOUNTS.items()},
         "endpoints": {
             "info": "/info?uid={uid}",
             "wishlist": "/wishlist?uid={uid}&region=BD",
@@ -289,7 +301,7 @@ def info():
     try:
         basic = lookup_all_regions(uid_int)
     except Exception as e:
-        logger.error(f"[INFO] lookup failed: {e}")
+        logger.error(f"[INFO] {e}")
         return jsonify({"error": str(e)}), 500
 
     if not basic:
@@ -326,7 +338,7 @@ def wishlist():
         res.ParseFromString(raw)
         return jsonify(proto_to_dict(res))
     except Exception as e:
-        logger.error(f"[WISHLIST] {region} failed: {e}")
+        logger.error(f"[WISHLIST] {region}: {e}")
         return jsonify({"error": str(e)}), 500
 
 
